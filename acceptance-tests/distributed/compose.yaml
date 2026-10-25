@@ -1,0 +1,82 @@
+name: distributed-ledger
+
+services:
+  kafka:
+    image: ${KAFKA_IMAGE:-apache/kafka-native:4.0.0}
+    container_name: distributed-ledger-kafka
+    mem_limit: 384m
+    ports:
+      - "9092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    volumes:
+      - kafka-data:/tmp/kraft-combined-logs
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: distributed-ledger-postgres
+    profiles: ["postgres"]
+    mem_limit: 192m
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=50"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  mariadb:
+    image: mariadb:11.4
+    container_name: distributed-ledger-mariadb
+    profiles: ["mariadb"]
+    mem_limit: 256m
+    ports:
+      - "3306:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: ledger
+      MARIADB_USER: ledger
+      MARIADB_PASSWORD: ledger
+    command:
+      - "--innodb-buffer-pool-size=64M"
+      - "--max-connections=50"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    volumes:
+      - mariadb-data:/var/lib/mysql
+
+volumes:
+  kafka-data:
+  postgres-data:
+  mariadb-data:

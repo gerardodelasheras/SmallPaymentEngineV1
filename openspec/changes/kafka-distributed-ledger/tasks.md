@@ -2,7 +2,7 @@
 
 ## 1. Planning checkpoint and distributed acceptance harness
 
-- [ ] 1.1 Commit the planning checkpoint on `main` with user approval: `proposal.md`, `proposal.council.md`, `specs/`, `design.md`, `adr.md`, the new `adr/0005-0012-*.md` files, and this `tasks.md`. Do not start code while specs-zone changes are uncommitted.
+- [x] 1.1 Commit the planning checkpoint on `main` with user approval: `proposal.md`, `proposal.council.md`, `specs/`, `design.md`, `adr.md`, the new `adr/0005-0012-*.md` files, and this `tasks.md`. Do not start code while specs-zone changes are uncommitted.
 - [ ] 1.2 Add a distributed acceptance harness (Python/Behave or a docker-compose-backed runner) that can start Kafka, PostgreSQL, and MariaDB, submit a manifest, wait for a job, and read the exported accounts CSV; keep the CLI suite untouched.
 - [ ] 1.3 Add the manifest/job page object and step definitions for `client-identity` and `stream-ingestion` scenarios.
 - [ ] 1.4 Add the distributed ledger step definitions for deposits, withdrawals, disputes, resolves, chargebacks, idempotent redelivery, journal terminal state, and the locking warning.
