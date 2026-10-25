@@ -68,15 +68,20 @@ class CliHarness:
         self.next_tx += 1
         return tx
 
+    def _explicit_tx(self, tx):
+        tx = int(tx)
+        self.next_tx = max(self.next_tx, tx + 1)
+        return tx
+
     def deposit(self, client, amount, tx=None):
-        tx = self.new_tx() if tx is None else int(tx)
+        tx = self.new_tx() if tx is None else self._explicit_tx(tx)
         self.add_row(f"deposit,{client},{tx},{amount}")
         self.last_client = int(client)
         self.last_deposit_tx = tx
         return tx
 
     def withdraw(self, client, amount, tx=None):
-        tx = self.new_tx() if tx is None else int(tx)
+        tx = self.new_tx() if tx is None else self._explicit_tx(tx)
         self.add_row(f"withdrawal,{client},{tx},{amount}")
         self.last_client = int(client)
         return tx

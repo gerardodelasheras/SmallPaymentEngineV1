@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::amount::Amount;
+
 /// Unified error type for row-level validation, ledger rules, and infrastructure.
 #[derive(Debug, Error)]
 pub enum ProcessingError {
@@ -25,6 +27,9 @@ pub enum ProcessingError {
 
     #[error("insufficient funds")]
     InsufficientFunds,
+
+    #[error("dispute exceeds available: disputed {amount}, available {available}")]
+    DisputeExceedsAvailable { amount: Amount, available: Amount },
 
     #[error("account is locked")]
     AccountLocked,

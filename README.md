@@ -25,8 +25,12 @@ including full trace logging:
 RUST_LOG=trace cargo run -- transactions.csv > accounts.csv
 ```
 
-Release builds compile trace and debug events out and clamp `RUST_LOG` to
-`info`. Logs go to standard error, so stdout remains valid accounts CSV.
+One diagnostic is emitted without `RUST_LOG`: when a dispute exceeds
+`available`, the account is locked and a warning naming the client is written
+to stderr. Explicit `RUST_LOG` filtering can suppress that warning in debug and
+test builds; release builds clamp `RUST_LOG` to `info`, so the warning is
+always emitted there. Logs go to standard error, so stdout remains valid
+accounts CSV.
 
 ## Architecture
 
@@ -130,7 +134,7 @@ The core types are:
 |---|---|---|---|
 | `deposit` | required | `available += amount` | Insert `Settled` |
 | `withdrawal` | required | Reject when `available < amount`; otherwise `available -= amount` | Insert `Settled` |
-| `dispute` | absent | `available -= amount`, `held += amount` | `Settled` -> `Disputed` |
+| `dispute` | absent | Reject when `available < amount` and lock the account; otherwise `available -= amount`, `held += amount` | Rejection leaves `Settled`; success moves `Settled` -> `Disputed` |
 | `resolve` | absent | `available += amount`, `held -= amount` | `Disputed` -> `Settled` |
 | `chargeback` | absent | `held -= amount`, then `locked = true` | Remove the entry; terminal |
 
@@ -179,8 +183,10 @@ withdrawal,1,2,0.5
 Rows that cannot be parsed or validated are skipped. With `RUST_LOG=trace`, a
 diagnostic is written to stderr. This includes unknown types, missing or
 unexpected amounts, invalid UTF-8, invalid client or transaction IDs, malformed
-decimals, negatives, more than four fraction digits, and overflow. A malformed
-or renamed header is not a row failure; it fails the run before row iteration.
+decimals, negatives, more than four fraction digits, and overflow. The one
+exception is an over-available dispute: it is skipped, locks the account, and
+emits a warning by default. A malformed or renamed header is not a row failure;
+it fails the run before row iteration.
 
 ### Output schema
 
@@ -194,7 +200,7 @@ consumers to depend on row order.
 | `available` | decimal | Funds available for withdrawal |
 | `held` | decimal | Funds frozen by active disputes |
 | `total` | decimal | Always `available + held` |
-| `locked` | boolean | `true` after a chargeback |
+| `locked` | boolean | `true` after a chargeback or a first over-available dispute |
 
 Amounts are rendered with trailing zeros stripped and at least one decimal
 place (`1.2300` -> `1.23`, `0.5000` -> `0.5`, `0` -> `0.0`).
@@ -216,18 +222,20 @@ client,available,held,total,locked
   malformed input, `i64` overflow, checked arithmetic, canonical `Display`
   output, and error precedence/payloads.
 - `src/account/account.rs` covers the zeroed default, the
-  `total = available + held` invariant, and credit overflow that leaves
-  balances unchanged.
+  `total = available + held` invariant, credit overflow that leaves balances
+  unchanged, exact-available holds, and the over-available hold rejection that
+  leaves balances unchanged.
 - `src/account/report.rs` covers the empty-map header and client-row rendering.
 - `src/transaction/parser.rs` covers header matching, reordered and extra
   columns, short non-monetary rows, malformed rows, invalid UTF-8, identifier
   ranges, and amount-presence rules.
 - `src/transaction/transaction_processor.rs` covers every state-machine path:
-  deposits and withdrawals, insufficient withdrawals, dispute holds (including
-  negative available balances), unknown transactions, duplicate disputes,
-  resolve, invalid resolve, chargeback, invalid chargeback, locked-account
-  rejection, cross-client disputes, duplicate IDs, missing amounts, terminal
-  account drains, and zeroed initialization of unknown clients.
+  deposits and withdrawals, insufficient withdrawals, dispute holds,
+  over-available disputes that lock the account without changing balances,
+  exact-available disputes, unknown transactions, duplicate disputes, resolve,
+  invalid resolve, chargeback, invalid chargeback, locked-account rejection,
+  cross-client disputes, duplicate IDs, missing amounts, terminal account
+  drains, and zeroed initialization of unknown clients.
 - `src/transaction/transaction_type.rs` covers parsing, trimming, and rejecting
   type names.
 - `src/client/dispatcher.rs` covers assigned-count priority, capacity
@@ -246,9 +254,10 @@ client,available,held,total,locked
 - 100 seeded random transaction sequences compared against the oracle.
 - A 10,000-row generated input compared against the oracle.
 - Table-driven edge cases: insufficient funds, dispute/resolve, chargeback
-  locking, cross-client disputes, unknown transactions, duplicate disputes,
-  resolving a non-disputed transaction, varying decimal precision, and
-  leading-dot amounts.
+  locking, over-available disputes that lock the account, exact-available
+  disputes, held funds surviving a rejected dispute, cross-client disputes,
+  unknown transactions, duplicate disputes, resolving a non-disputed
+  transaction, varying decimal precision, and leading-dot amounts.
 - A header-only input producing only the output header.
 - Oversized fields: amount overflow, client IDs beyond `u16`, and transaction
   IDs beyond `u32`.
@@ -313,11 +322,13 @@ the specification examples. `tests/run_tests.sh` regenerates the matching
 ## Error Handling
 
 Row-level failures are skipped so the stream can continue. With
-`RUST_LOG=trace`, they are logged to stderr. Examples include `InvalidType`,
-`InvalidAmount`, `NegativeAmount`, `TooManyDecimals`, `MissingAmount`,
-`UnexpectedAmount`, `InsufficientFunds`, `AccountLocked`,
-`UnknownTransaction`, `AlreadyDisputed`, `NotDisputed`, `NotOwner`,
-`DuplicateTransaction`, `Overflow`, `Underflow`, and non-I/O `Csv` row errors.
+`RUST_LOG=trace`, they are logged to stderr. One class is different:
+`DisputeExceedsAvailable` is logged at warn level by default, skips the row,
+and locks the account. Other examples include `InvalidType`, `InvalidAmount`,
+`NegativeAmount`, `TooManyDecimals`, `MissingAmount`, `UnexpectedAmount`,
+`InsufficientFunds`, `AccountLocked`, `UnknownTransaction`,
+`AlreadyDisputed`, `NotDisputed`, `NotOwner`, `DuplicateTransaction`,
+`Overflow`, `Underflow`, and non-I/O `Csv` row errors.
 
 Infrastructure failures fail the run instead of producing silently incomplete
 output:
@@ -337,13 +348,14 @@ output:
 
 ### Assumptions
 
-- **Disputes may overdraw `available`.** The specification requires a dispute to
-  decrease `available` by the disputed amount and increase `held`, keeping
-  `total` unchanged. It does not define an insufficient-funds failure for
-  disputes. This processor follows that literal rule, so `available` may become
-  negative while `total = available + held` still holds. For example, a deposit
-  of `100`, a withdrawal of `80`, and a dispute of the deposit produce
-  `available = -80`, `held = 100`, and `total = 20`.
+- **Over-available disputes are rejected and lock the account.** A dispute is
+  accepted only when `available >= the referenced transaction's amount`. When
+  the amount exceeds `available`, the dispute is skipped without changing
+  balances or the transaction entry, and the account is locked immediately. This
+  is stricter than the initial design's literal reading, which allowed
+  `available` to go negative. The lock is terminal for the run: later rows for
+  that client are rejected, held funds remain held, and there is no unlock path.
+  The first such rejection emits a warning by default; see [Usage](#usage).
 - **Already-disputed transactions are ignored.** A second dispute on a
   transaction already in `Disputed` state is skipped. The specification only
   explicitly requires ignoring unknown transactions; rejecting a transaction
@@ -363,14 +375,15 @@ output:
 - **Resolved transactions can be disputed again.** `resolve` returns the entry
   to `Settled`, so a later `dispute` can hold the same funds again. The
   specification does not explicitly forbid a second dispute after resolution.
-- **Locked accounts reject all later operations.** A successful chargeback sets
-  `locked = true`; every later row for that client is skipped with
-  `AccountLocked`. This follows the frozen-account behavior in the
-  specification.
+- **Locked accounts reject all later operations.** A successful chargeback or a
+  first over-available dispute sets `locked = true`; every later row for that
+  client is skipped with `AccountLocked`. This follows the frozen-account
+  behavior in the specification.
 - **Disputes may target withdrawals.** Accepted withdrawals are indexed as
-  settled transactions, so a dispute can reference one and the hold rules apply
-  unchanged. The alternative (deposits-only disputes) is the more conservative
-  reading; the specification does not restrict the referenced transaction type.
+  settled transactions, so a dispute can reference one and the hold rules,
+  including the over-available lock, apply unchanged. The alternative
+  (deposits-only disputes) is the more conservative reading; the specification
+  does not restrict the referenced transaction type.
 - **Output precision follows the example.** Amounts are rendered with trailing
   zeros stripped and at least one decimal place, matching the SPEC §3.2 example.
   This supersedes §2.3's "four-decimal" prose under the §7.2 precedence rule.
@@ -381,7 +394,9 @@ output:
 
 ### Edge behavior
 
-- A chargeback removes the transaction entry; the entry is terminal.
+- A successful chargeback removes the transaction entry; the entry is terminal.
+- An over-available dispute is skipped with `DisputeExceedsAvailable` and locks
+  the account; later rows for that client are rejected with `AccountLocked`.
 - An unknown transaction is skipped with `UnknownTransaction`; a wrong-state
   reference is skipped with `NotDisputed` or `AlreadyDisputed`; the stream
   continues.

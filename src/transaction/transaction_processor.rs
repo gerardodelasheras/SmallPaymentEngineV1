@@ -105,15 +105,23 @@ impl TransactionProcessor {
             }
         };
 
-        self.account_mut(transaction.client).hold(amount)?;
-        self.entries.insert(
-            transaction.transaction_id,
-            TransactionEntry::Disputed {
-                client: transaction.client,
-                amount,
-            },
-        );
-        Ok(())
+        match self.account_mut(transaction.client).hold(amount) {
+            Ok(()) => {
+                self.entries.insert(
+                    transaction.transaction_id,
+                    TransactionEntry::Disputed {
+                        client: transaction.client,
+                        amount,
+                    },
+                );
+                Ok(())
+            }
+            Err(error @ ProcessingError::DisputeExceedsAvailable { .. }) => {
+                self.account_mut(transaction.client).locked = true;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn process_resolve(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
@@ -248,10 +256,11 @@ mod tests {
         assert_eq!(account.available, Amount::ZERO);
         assert_eq!(account.held, amount("10.0").unwrap());
         assert_eq!(account.total(), amount("10.0").unwrap());
+        assert!(!account.locked);
     }
 
     #[test]
-    fn dispute_may_overdraw_available() {
+    fn dispute_that_exceeds_available_locks_the_account_without_changing_balances() {
         let mut processor = TransactionProcessor::new();
         deposit(&mut processor, 1, 1, "100.0");
         processor
@@ -262,13 +271,78 @@ mod tests {
                 Some("80.0"),
             ))
             .expect("withdrawal succeeds");
+
+        assert!(matches!(
+            processor.process(&transaction(TransactionType::Dispute, 1, 1, None)),
+            Err(ProcessingError::DisputeExceedsAvailable { .. })
+        ));
+
+        let account = account(&processor, 1);
+        assert_eq!(account.available, amount("20.0").unwrap());
+        assert_eq!(account.held, Amount::ZERO);
+        assert_eq!(account.total(), amount("20.0").unwrap());
+        assert!(account.locked);
+    }
+
+    #[test]
+    fn later_operations_after_an_over_available_dispute_are_rejected() {
+        let mut processor = TransactionProcessor::new();
+        deposit(&mut processor, 1, 1, "10.0");
+        processor
+            .process(&transaction(
+                TransactionType::Withdrawal,
+                1,
+                2,
+                Some("10.0"),
+            ))
+            .expect("withdrawal succeeds");
+
+        assert!(matches!(
+            processor.process(&transaction(TransactionType::Dispute, 1, 1, None)),
+            Err(ProcessingError::DisputeExceedsAvailable { .. })
+        ));
+        assert!(matches!(
+            processor.process(&transaction(TransactionType::Deposit, 1, 3, Some("5.0"))),
+            Err(ProcessingError::AccountLocked)
+        ));
+
+        let account = account(&processor, 1);
+        assert_eq!(account.available, Amount::ZERO);
+        assert_eq!(account.held, Amount::ZERO);
+        assert!(account.locked);
+    }
+
+    #[test]
+    fn held_funds_remain_after_an_over_available_dispute_locks_the_account() {
+        let mut processor = TransactionProcessor::new();
+        deposit(&mut processor, 1, 1, "10.0");
+        deposit(&mut processor, 1, 2, "20.0");
         processor
             .process(&transaction(TransactionType::Dispute, 1, 1, None))
-            .expect("dispute succeeds");
+            .expect("first dispute succeeds");
+        processor
+            .process(&transaction(
+                TransactionType::Withdrawal,
+                1,
+                3,
+                Some("10.0"),
+            ))
+            .expect("withdrawal succeeds");
+
+        assert!(matches!(
+            processor.process(&transaction(TransactionType::Dispute, 1, 2, None)),
+            Err(ProcessingError::DisputeExceedsAvailable { .. })
+        ));
+        assert!(matches!(
+            processor.process(&transaction(TransactionType::Chargeback, 1, 2, None)),
+            Err(ProcessingError::AccountLocked)
+        ));
+
         let account = account(&processor, 1);
-        assert_eq!(account.available.to_string(), "-80.0");
-        assert_eq!(account.held, amount("100.0").unwrap());
+        assert_eq!(account.available, amount("10.0").unwrap());
+        assert_eq!(account.held, amount("10.0").unwrap());
         assert_eq!(account.total(), amount("20.0").unwrap());
+        assert!(account.locked);
     }
 
     #[test]
@@ -279,6 +353,7 @@ mod tests {
             Err(ProcessingError::UnknownTransaction(99))
         ));
         assert_eq!(account(&processor, 1).available, Amount::ZERO);
+        assert!(!account(&processor, 1).locked);
     }
 
     #[test]
@@ -293,6 +368,7 @@ mod tests {
             Err(ProcessingError::AlreadyDisputed(1))
         ));
         assert_eq!(account(&processor, 1).held, amount("10.0").unwrap());
+        assert!(!account(&processor, 1).locked);
     }
 
     #[test]
@@ -402,6 +478,7 @@ mod tests {
         ));
         assert_eq!(account(&processor, 1).available, amount("10.0").unwrap());
         assert_eq!(account(&processor, 2).held, Amount::ZERO);
+        assert!(!account(&processor, 2).locked);
     }
 
     #[test]

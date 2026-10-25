@@ -127,6 +127,10 @@ impl Oracle {
                     return;
                 }
                 let account = self.accounts.get_mut(&client).expect("initialized");
+                if account.available < entry.amount {
+                    account.locked = true;
+                    return;
+                }
                 account.available -= entry.amount;
                 account.held += entry.amount;
                 self.entries.get_mut(&tx).expect("entry exists").disputed = true;
@@ -331,6 +335,84 @@ async fn dispute_resolve_and_chargeback_follow_the_state_machine() {
             tx: 2,
             amount: 5_000,
         },
+    ])
+    .await;
+}
+
+#[tokio::test]
+async fn over_available_dispute_locks_without_changing_balances() {
+    assert_matches_oracle(&[
+        Row::Deposit {
+            client: 1,
+            tx: 1,
+            amount: 1_000_000,
+        },
+        Row::Withdrawal {
+            client: 1,
+            tx: 2,
+            amount: 800_000,
+        },
+        Row::Dispute { client: 1, tx: 1 },
+        Row::Deposit {
+            client: 1,
+            tx: 3,
+            amount: 50_000,
+        },
+    ])
+    .await;
+}
+
+#[tokio::test]
+async fn exact_available_dispute_is_allowed() {
+    assert_matches_oracle(&[
+        Row::Deposit {
+            client: 1,
+            tx: 1,
+            amount: 100_000,
+        },
+        Row::Dispute { client: 1, tx: 1 },
+        Row::Resolve { client: 1, tx: 1 },
+    ])
+    .await;
+}
+
+#[tokio::test]
+async fn chargeback_after_a_rejected_dispute_leaves_held_funds() {
+    assert_matches_oracle(&[
+        Row::Deposit {
+            client: 1,
+            tx: 1,
+            amount: 100_000,
+        },
+        Row::Deposit {
+            client: 1,
+            tx: 2,
+            amount: 200_000,
+        },
+        Row::Dispute { client: 1, tx: 1 },
+        Row::Withdrawal {
+            client: 1,
+            tx: 3,
+            amount: 100_000,
+        },
+        Row::Dispute { client: 1, tx: 2 },
+        Row::Chargeback { client: 1, tx: 2 },
+    ])
+    .await;
+}
+
+#[tokio::test]
+async fn rejected_disputes_do_not_lock_the_account() {
+    assert_matches_oracle(&[
+        Row::Deposit {
+            client: 1,
+            tx: 1,
+            amount: 100_000,
+        },
+        Row::Dispute { client: 1, tx: 99 },
+        Row::Dispute { client: 2, tx: 1 },
+        Row::Dispute { client: 1, tx: 1 },
+        Row::Dispute { client: 1, tx: 1 },
     ])
     .await;
 }

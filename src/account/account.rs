@@ -41,6 +41,13 @@ impl Account {
     }
 
     pub fn hold(&mut self, amount: Amount) -> Result<(), ProcessingError> {
+        if self.available < amount {
+            return Err(ProcessingError::DisputeExceedsAvailable {
+                amount,
+                available: self.available,
+            });
+        }
+
         let available = self
             .available
             .checked_sub(amount)
@@ -167,5 +174,47 @@ mod tests {
             Err(ProcessingError::Overflow)
         ));
         assert_eq!(account.available, Amount::from_scaled(i64::MAX));
+    }
+
+    #[test]
+    fn hold_rejects_an_over_available_dispute_without_changing_balances() {
+        let mut account = Account::default();
+        account.credit(amount("3.0")).expect("credit fits");
+
+        assert!(matches!(
+            account.hold(amount("5.0")),
+            Err(ProcessingError::DisputeExceedsAvailable { .. })
+        ));
+
+        assert_eq!(account.available, amount("3.0"));
+        assert_eq!(account.held, Amount::ZERO);
+    }
+
+    #[test]
+    fn hold_of_exactly_available_moves_funds_to_held() {
+        let mut account = Account::default();
+        account.credit(amount("5.0")).expect("credit fits");
+
+        account.hold(amount("5.0")).expect("hold fits");
+
+        assert_eq!(account.available, Amount::ZERO);
+        assert_eq!(account.held, amount("5.0"));
+    }
+
+    #[test]
+    fn hold_overflow_is_not_reported_as_an_over_available_dispute() {
+        let mut account = Account {
+            available: Amount::from_scaled(1),
+            held: Amount::from_scaled(i64::MAX),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            account.hold(Amount::from_scaled(1)),
+            Err(ProcessingError::Overflow)
+        ));
+
+        assert_eq!(account.available, Amount::from_scaled(1));
+        assert_eq!(account.held, Amount::from_scaled(i64::MAX));
     }
 }

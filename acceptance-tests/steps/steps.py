@@ -296,6 +296,11 @@ def step_processor_runs_with_trace(context):
     context.cli.run(rust_log="trace")
 
 
+@when("the processor runs with RUST_LOG set to error")
+def step_processor_runs_with_error(context):
+    context.cli.run(rust_log="error")
+
+
 @when("the processor is invoked with that one argument")
 def step_processor_invoked_with_argument(context):
     context.cli.run()
@@ -462,6 +467,18 @@ def step_stderr_quiet(context):
 @then("the rejected row is reported on stderr")
 def step_rejected_row_reported(context):
     assert context.cli.stderr_text().strip()
+
+
+@then("stderr contains a warning naming client {client}")
+def step_stderr_warning_for_client(context, client):
+    stderr = context.cli.stderr_text().lower()
+    assert f"client {client}" in stderr or f"client={client}" in stderr
+    assert "dispute" in stderr
+
+
+@then("stderr states that the account is locked")
+def step_stderr_account_locked(context):
+    assert "account locked" in context.cli.stderr_text().lower()
 
 
 @then("the accounts CSV is written to stdout")

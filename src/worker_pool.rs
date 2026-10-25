@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 
 use crate::account::account::Account;
 use crate::client::client_id::ClientId;
@@ -119,10 +119,22 @@ async fn run_worker(mut receiver: mpsc::Receiver<Command>) {
         match command {
             Command::Process(transaction) => {
                 if let Err(problem) = processor.process(&transaction) {
-                    if problem.is_recoverable() {
-                        trace!(error = %problem, "skipped transaction row");
-                    } else {
-                        error!(error = %problem, "worker infrastructure error");
+                    match problem {
+                        error @ ProcessingError::DisputeExceedsAvailable { .. } => {
+                            warn!(
+                                client = transaction.client,
+                                transaction_id = transaction.transaction_id,
+                                error = %error,
+                                "client {} dispute exceeds available; account locked",
+                                transaction.client
+                            );
+                        }
+                        problem if problem.is_recoverable() => {
+                            trace!(error = %problem, "skipped transaction row");
+                        }
+                        problem => {
+                            error!(error = %problem, "worker infrastructure error");
+                        }
                     }
                 }
             }
