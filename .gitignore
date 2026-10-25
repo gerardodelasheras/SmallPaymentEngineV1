@@ -4,5 +4,7 @@
 /acceptance-tests/.extracted/
 /acceptance-tests/reports/
 /acceptance-tests/.venv/
+/acceptance-tests/distributed/features/
+/acceptance-tests/distributed/reports/
 __pycache__/
 *.pyc

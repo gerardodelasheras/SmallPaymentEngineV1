@@ -15,10 +15,37 @@ from openspec_effective_spec import CompositionError, effective_locations, sourc
 def main(argv):
     os.chdir(HERE)
 
+    flags = ("--specs", "--print-locations", "--lint")
     specs_only = "--specs" in argv
     print_only = "--print-locations" in argv
     lint = "--lint" in argv
-    passthrough = [a for a in argv if a not in ("--specs", "--print-locations", "--lint")]
+
+    exclude_changes = []
+    passthrough = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--exclude-change":
+            if index + 1 >= len(argv):
+                sys.stderr.write("--exclude-change requires a change name\n")
+                return 2
+            exclude_changes.append(argv[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--exclude-change="):
+            exclude_changes.append(arg.split("=", 1)[1])
+            index += 1
+            continue
+        if arg not in flags:
+            passthrough.append(arg)
+        index += 1
+
+    scope_file = HERE / "distributed" / "scope.txt"
+    if scope_file.exists():
+        for line in scope_file.read_text(encoding="utf-8").splitlines():
+            name = line.strip()
+            if name and not name.startswith("#") and name not in exclude_changes:
+                exclude_changes.append(name)
 
     try:
         out_dir, written = extract_all()
@@ -31,7 +58,11 @@ def main(argv):
         return subprocess.call(["npx", "gherkin-lint", ".extracted"])
 
     try:
-        locations = source_of_truth_locations() if specs_only else effective_locations()
+        locations = (
+            source_of_truth_locations()
+            if specs_only
+            else effective_locations(exclude_changes=exclude_changes)
+        )
     except CompositionError as err:
         sys.stderr.write("[effective-spec] %s\n" % err)
         return 1

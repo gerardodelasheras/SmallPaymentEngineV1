@@ -124,10 +124,15 @@ def _rel(path):
     return path.relative_to(HERE).as_posix()
 
 
-def effective_locations():
+def effective_locations(exclude_changes=None):
     delta_paths = sorted(
         _rel(p) for p in (HERE / ".extracted" / "changes").glob("*/specs/**/*.feature") if "changes/archive/" not in _rel(p)
     )
+    excluded = {str(name) for name in (exclude_changes or ())}
+    if excluded:
+        delta_paths = [
+            path for path in delta_paths if _change_id_of(path) not in excluded
+        ]
     sot_paths = sorted(_rel(p) for p in (HERE / ".extracted" / "specs").glob("**/*.feature"))
 
     superseded = collect_superseded_rules(delta_paths)

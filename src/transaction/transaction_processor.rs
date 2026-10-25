@@ -430,6 +430,22 @@ mod tests {
     }
 
     #[test]
+    fn chargeback_removes_the_entry_and_allows_reuse_by_another_client() {
+        let mut processor = TransactionProcessor::new();
+        deposit(&mut processor, 1, 1, "10.0");
+        processor
+            .process(&transaction(TransactionType::Dispute, 1, 1, None))
+            .unwrap();
+        processor
+            .process(&transaction(TransactionType::Chargeback, 1, 1, None))
+            .unwrap();
+
+        deposit(&mut processor, 2, 1, "5.0");
+
+        assert_eq!(account(&processor, 2).available, amount("5.0").unwrap());
+    }
+
+    #[test]
     fn chargeback_of_settled_transaction_is_rejected() {
         let mut processor = TransactionProcessor::new();
         deposit(&mut processor, 1, 1, "10.0");

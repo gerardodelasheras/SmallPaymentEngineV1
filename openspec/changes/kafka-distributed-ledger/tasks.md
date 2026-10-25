@@ -3,8 +3,8 @@
 ## 1. Planning checkpoint and distributed acceptance harness
 
 - [x] 1.1 Commit the planning checkpoint on `main` with user approval: `proposal.md`, `proposal.council.md`, `specs/`, `design.md`, `adr.md`, the new `adr/0005-0012-*.md` files, and this `tasks.md`. Do not start code while specs-zone changes are uncommitted.
-- [ ] 1.2 Add a distributed acceptance harness (Python/Behave or a docker-compose-backed runner) that can start Kafka, PostgreSQL, and MariaDB, submit a manifest, wait for a job, and read the exported accounts CSV; keep the CLI suite untouched.
-- [ ] 1.3 Add the manifest/job page object and step definitions for `client-identity` and `stream-ingestion` scenarios.
+- [x] 1.2 Add a distributed acceptance harness (Python/Behave or a docker-compose-backed runner) that can start Kafka, PostgreSQL, and MariaDB, submit a manifest, wait for a job, and read the exported accounts CSV; keep the CLI suite untouched.
+- [x] 1.3 Add the manifest/job page object and step definitions for `client-identity` and `stream-ingestion` scenarios.
 - [ ] 1.4 Add the distributed ledger step definitions for deposits, withdrawals, disputes, resolves, chargebacks, idempotent redelivery, journal terminal state, and the locking warning.
 - [ ] 1.5 Add the job/reporting step definitions for completion, touched clients, rejected-row initialization, second-job rejection, failure, and resubmission.
 - [ ] 1.6 Add the database-portability and distributed-operations step definitions for both backends, conflict retries, configuration, migrations, DLQ, health, and metrics.
@@ -13,8 +13,8 @@
 
 ## 2. Packaging and shared ledger core
 
-- [ ] 2.1 Add a separate `distributed/` crate/workspace member with entry points for ingest, partition, worker, export, and migrate; keep the existing package as the default member and bare `cargo run` working.
-- [ ] 2.2 Add a CLI regression test for chargeback followed by reuse of the same transaction ID, pinning the current in-memory delete behaviour before refactoring.
+- [x] 2.1 Add a separate `distributed/` crate/workspace member with entry points for ingest, partition, worker, export, and migrate; keep the existing package as the default member and bare `cargo run` working.
+- [x] 2.2 Add a CLI regression test for chargeback followed by reuse of the same transaction ID, pinning the current in-memory delete behaviour before refactoring.
 - [ ] 2.3 Extract a pure shared ledger core: account mutation, journal lookup/effect, dispute/resolve/chargeback transitions, and identifier/index boundaries.
 - [ ] 2.4 Adapt the in-memory `TransactionProcessor` to the shared core without changing CLI behaviour or output.
 - [ ] 2.5 Generalize the identifier boundary so the CLI keeps `u16` and the distributed adapter uses canonical `BIGINT`; update the library exports and document the library API break.
