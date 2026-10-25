@@ -49,6 +49,9 @@ pub enum ProcessingError {
     #[error("duplicate transaction identifier: {0}")]
     DuplicateTransaction(u32),
 
+    #[error("transaction is charged back and terminal: {0}")]
+    ChargedBack(u32),
+
     #[error("invalid CSV header: {0}")]
     InvalidHeader(String),
 

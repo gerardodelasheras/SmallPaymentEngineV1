@@ -68,7 +68,7 @@ Key properties:
   (`QUEUE_CAPACITY = 256`). The producer uses `blocking_send`; when a queue is
   full, the reader waits instead of growing the backlog.
 - **Worker-local state.** Each `TransactionProcessor` owns its
-  `HashMap<ClientId, Account>` and `HashMap<TransactionId, TransactionEntry>`.
+  `HashMap<ClientId, Account>` and `HashMap<TransactionId, LedgerEntry<ClientId>>`.
   No account is mutated by more than one worker, so no locks are needed.
 - **Fixed-point currency.** Every amount is an `i64` scaled by `10_000`
   (`1.23` is stored as `12300`). No floating point or decimal crate is used in
@@ -76,6 +76,28 @@ Key properties:
 - **Deterministic output order.** The report currently sorts rows by client,
   though the contract does not require consumers to depend on row order.
   Worker assignment is not visible in stdout.
+
+### Shared ledger core
+
+`ledger::core::apply` is the storage-independent state machine used by the
+in-memory CLI and available to the future distributed adapter. It mutates one
+`Account`, reads a `Journal<C>` for the referenced transaction, and returns a
+`JournalEffect<C>` that the adapter applies with its own storage semantics.
+`C` is the client-identifier boundary: the CLI keeps `ClientId = u16`, while the
+distributed variant can use `CanonicalClientId = i64`. Transaction identifiers
+remain `u32`.
+
+`JournalPolicy` selects chargeback journal behaviour. The in-memory CLI uses
+`DeleteOnChargeback`, preserving its existing remove-on-chargeback behaviour;
+the distributed adapter will use `RetainChargedBack` and keep a terminal
+`charged_back` row.
+
+**BREAKING library change:** the shared API now exposes `LedgerEntry`,
+`EntryState`, `LedgerTransaction`, `Journal`, `JournalEffect`, and
+`JournalPolicy`. `transaction::transaction_entry::TransactionEntry` is now a
+type alias for `LedgerEntry<ClientId>`; its old `Settled`/`Disputed` enum
+variants no longer exist. Read `entry.state` with `EntryState` instead. The
+CLI's arguments, output, and observable behaviour are unchanged.
 
 ## Data Flow & Domain Entities
 
@@ -409,12 +431,16 @@ src/                          Shared library and binary entry points
     account.rs                Client account and ledger operations
     report.rs                 Accounts CSV writer
   client/                     Client identity and routing
-    client_id.rs              ClientId alias
+    client_id.rs              ClientId and CanonicalClientId aliases
     dispatcher.rs             Least-loaded client-to-worker assignment
+  ledger/                     Storage-independent ledger core
+    core.rs                   Shared state machine and journal effects
+    entry.rs                  Ledger IDs, entries, transactions, and effects
+    journal.rs                Read-only journal lookup contract
   transaction/                Transaction model, parsing, and processing
     parser.rs                 CSV parsing and validation
     transaction.rs            Transaction input row
-    transaction_entry.rs      Settled/Disputed lifecycle entry
+    transaction_entry.rs      Compatibility alias for LedgerEntry<ClientId>
     transaction_id.rs         TransactionId alias
     transaction_processor.rs  Per-worker account and entry state machine
     transaction_type.rs       Deposit/withdrawal/dispute/resolve/chargeback enum

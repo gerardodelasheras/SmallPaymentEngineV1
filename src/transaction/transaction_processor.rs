@@ -1,19 +1,25 @@
 use std::collections::HashMap;
 
 use crate::account::account::Account;
-use crate::amount::Amount;
 use crate::client::client_id::ClientId;
+use crate::ledger::core::{apply, JournalPolicy};
+use crate::ledger::entry::{JournalEffect, LedgerEntry, LedgerTransaction};
+use crate::ledger::journal::Journal;
 use crate::processing_error::ProcessingError;
 use crate::transaction::transaction::Transaction;
-use crate::transaction::transaction_entry::TransactionEntry;
 use crate::transaction::transaction_id::TransactionId;
-use crate::transaction::transaction_type::TransactionType;
 
 /// Per-worker account and transaction state machine.
 #[derive(Debug, Default)]
 pub struct TransactionProcessor {
     accounts: HashMap<ClientId, Account>,
-    entries: HashMap<TransactionId, TransactionEntry>,
+    entries: HashMap<TransactionId, LedgerEntry<ClientId>>,
+}
+
+impl Journal<ClientId> for HashMap<TransactionId, LedgerEntry<ClientId>> {
+    fn get(&self, id: TransactionId) -> Option<LedgerEntry<ClientId>> {
+        HashMap::get(self, &id).copied()
+    }
 }
 
 impl TransactionProcessor {
@@ -22,137 +28,32 @@ impl TransactionProcessor {
     }
 
     pub fn process(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
+        let Self { accounts, entries } = self;
+
         // A parsed row initializes its client before domain validation.
-        self.accounts.entry(transaction.client).or_default();
+        let account = accounts.entry(transaction.client).or_default();
+        let ledger_transaction = LedgerTransaction {
+            transaction_type: transaction.transaction_type,
+            client: transaction.client,
+            transaction_id: transaction.transaction_id,
+            amount: transaction.amount,
+        };
 
-        if self
-            .accounts
-            .get(&transaction.client)
-            .map(|account| account.locked)
-            .unwrap_or(false)
-        {
-            return Err(ProcessingError::AccountLocked);
-        }
-
-        match transaction.transaction_type {
-            TransactionType::Deposit => self.process_deposit(transaction),
-            TransactionType::Withdrawal => self.process_withdrawal(transaction),
-            TransactionType::Dispute => self.process_dispute(transaction),
-            TransactionType::Resolve => self.process_resolve(transaction),
-            TransactionType::Chargeback => self.process_chargeback(transaction),
-        }
-    }
-
-    fn process_deposit(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
-        let amount = transaction.amount.ok_or(ProcessingError::MissingAmount)?;
-        if self.entries.contains_key(&transaction.transaction_id) {
-            return Err(ProcessingError::DuplicateTransaction(
-                transaction.transaction_id,
-            ));
-        }
-
-        self.account_mut(transaction.client).credit(amount)?;
-        self.record_settled(transaction, amount);
-        Ok(())
-    }
-
-    fn process_withdrawal(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
-        let amount = transaction.amount.ok_or(ProcessingError::MissingAmount)?;
-        if self.entries.contains_key(&transaction.transaction_id) {
-            return Err(ProcessingError::DuplicateTransaction(
-                transaction.transaction_id,
-            ));
-        }
-
-        self.account_mut(transaction.client).debit(amount)?;
-        self.record_settled(transaction, amount);
-        Ok(())
-    }
-
-    fn record_settled(&mut self, transaction: &Transaction, amount: Amount) {
-        self.entries.insert(
-            transaction.transaction_id,
-            TransactionEntry::Settled {
-                client: transaction.client,
-                amount,
-            },
-        );
-    }
-
-    fn account_mut(&mut self, client: ClientId) -> &mut Account {
-        self.accounts.entry(client).or_default()
-    }
-
-    fn lookup(&self, transaction: &Transaction) -> Result<TransactionEntry, ProcessingError> {
-        let entry = self.entries.get(&transaction.transaction_id).ok_or(
-            ProcessingError::UnknownTransaction(transaction.transaction_id),
+        let effect = apply(
+            account,
+            &ledger_transaction,
+            &*entries,
+            JournalPolicy::DeleteOnChargeback,
         )?;
-        let owner = match entry {
-            TransactionEntry::Settled { client, .. }
-            | TransactionEntry::Disputed { client, .. } => *client,
-        };
-        if owner != transaction.client {
-            return Err(ProcessingError::NotOwner(transaction.transaction_id));
+
+        match effect {
+            JournalEffect::Insert(entry) => {
+                entries.insert(transaction.transaction_id, entry);
+            }
+            JournalEffect::Remove => {
+                entries.remove(&transaction.transaction_id);
+            }
         }
-        Ok(*entry)
-    }
-
-    fn process_dispute(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
-        let amount = match self.lookup(transaction)? {
-            TransactionEntry::Settled { amount, .. } => amount,
-            TransactionEntry::Disputed { .. } => {
-                return Err(ProcessingError::AlreadyDisputed(transaction.transaction_id));
-            }
-        };
-
-        match self.account_mut(transaction.client).hold(amount) {
-            Ok(()) => {
-                self.entries.insert(
-                    transaction.transaction_id,
-                    TransactionEntry::Disputed {
-                        client: transaction.client,
-                        amount,
-                    },
-                );
-                Ok(())
-            }
-            Err(error @ ProcessingError::DisputeExceedsAvailable { .. }) => {
-                self.account_mut(transaction.client).locked = true;
-                Err(error)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn process_resolve(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
-        let amount = match self.lookup(transaction)? {
-            TransactionEntry::Disputed { amount, .. } => amount,
-            TransactionEntry::Settled { .. } => {
-                return Err(ProcessingError::NotDisputed(transaction.transaction_id));
-            }
-        };
-
-        self.account_mut(transaction.client).release(amount)?;
-        self.entries.insert(
-            transaction.transaction_id,
-            TransactionEntry::Settled {
-                client: transaction.client,
-                amount,
-            },
-        );
-        Ok(())
-    }
-
-    fn process_chargeback(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
-        let amount = match self.lookup(transaction)? {
-            TransactionEntry::Disputed { amount, .. } => amount,
-            TransactionEntry::Settled { .. } => {
-                return Err(ProcessingError::NotDisputed(transaction.transaction_id));
-            }
-        };
-
-        self.account_mut(transaction.client).chargeback(amount)?;
-        self.entries.remove(&transaction.transaction_id);
         Ok(())
     }
 
@@ -164,6 +65,10 @@ impl TransactionProcessor {
         &self.accounts
     }
 
+    pub fn entries(&self) -> &HashMap<TransactionId, LedgerEntry<ClientId>> {
+        &self.entries
+    }
+
     pub fn snapshot(&self) -> HashMap<ClientId, Account> {
         self.accounts.clone()
     }
@@ -173,6 +78,7 @@ impl TransactionProcessor {
 mod tests {
     use super::*;
     use crate::amount::Amount;
+    use crate::transaction::transaction_type::TransactionType;
 
     fn amount(value: &str) -> Option<Amount> {
         Some(Amount::parse(value).expect("valid amount"))

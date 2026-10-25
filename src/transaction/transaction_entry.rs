@@ -1,9 +1,13 @@
-use crate::amount::Amount;
+//! Compatibility surface for the shared ledger journal entry.
+//!
+//! **BREAKING:** `TransactionEntry` used to be an enum with `Settled` and
+//! `Disputed` variants. It is now an alias for `LedgerEntry<ClientId>`, whose
+//! lifecycle state lives in the `state` field. Library consumers should use
+//! `LedgerEntry` and `EntryState` directly.
+
+pub use crate::ledger::entry::{EntryState, LedgerEntry};
+
 use crate::client::client_id::ClientId;
 
-/// An accepted monetary transaction kept for later dispute operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransactionEntry {
-    Settled { client: ClientId, amount: Amount },
-    Disputed { client: ClientId, amount: Amount },
-}
+/// The in-memory CLI's journal entry type.
+pub type TransactionEntry = LedgerEntry<ClientId>;
