@@ -7,14 +7,14 @@ This change deliberately deviates. An over-available dispute is treated as a fir
 ## What Changes
 
 - A dispute is accepted only when `available` is at least the referenced transaction's amount. Exact-available disputes still succeed.
-- **BREAKING**: a dispute whose amount exceeds `available` is rejected in full and immediately locks the account. The row is skipped; balances and the transaction entry are unchanged; the entry stays settled; a later chargeback is rejected as not disputed. Previously the row moved the full amount into `held` and produced a negative `available`.
+- **BREAKING**: a dispute whose amount exceeds `available` is rejected in full and immediately locks the account. The row is skipped; balances and the transaction entry are unchanged; the entry stays settled; a later chargeback for that client is rejected because the account is locked. Previously the row moved the full amount into `held` and produced a negative `available`.
 - Only the insufficient-`available` branch of the dispute hold locks. Unknown, foreign, or already-disputed references are rejected without locking, and a locked account is rejected before validation. The new locking error is distinct from the withdrawal insufficient-funds error.
 - The rejection is recoverable: processing continues, later rows for other clients are applied, and the run exits 0. The triggering row reports the overdraft rejection, not the locked-account error.
 - The immediate lock uses the existing terminal locked state. All later rows for that client are rejected as locked. Funds already held by active disputes remain held, so the report can show `locked = true` with `held > 0`. The lock is indistinguishable from a chargeback lock in the accounts CSV; there is no unlock path.
 - Emit one warning per account locked this way, at warn level by default, naming the client and stating the lock. Release builds always emit it; debug and test builds can suppress it with explicit `RUST_LOG` filtering. Every other recoverable row remains trace-only.
 - The current variant is in-memory, so the lock lasts for the run; persistence belongs to the future database-backed variant.
 - The resulting invariants are `available >= 0` and `total >= 0`. The negative-`available` clauses in `account-reporting` and `amount-arithmetic` become unobservable through the ledger. Keep minus-sign rendering as defensive formatter behavior covered by the existing `Amount` unit test, but remove the now-false scenarios from both specs.
-- No other ledger rule changes. The exception is the chargeback-after-rejected-dispute path, which now returns not-disputed instead of succeeding.
+- No other ledger rule changes. The exception is the chargeback-after-rejected-dispute path: the entry stays settled, and a later chargeback is rejected by the locked-account guard.
 - The rejected-row atomicity requirement is amended to allow exactly one rejected-row state effect: the immediate lock on an over-available dispute. All retained scenarios of every modified requirement must be restated, with requirement names matched exactly, because the acceptance composer replaces the whole source block and only warns when a modified name is not found.
 
 ## Capabilities
