@@ -4,6 +4,7 @@
 //! `ledger` user access to it.
 
 use std::io::Write;
+use std::sync::Arc;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
@@ -157,6 +158,11 @@ async fn mariadb_repository_applies_events_atomically() {
     let repository = MariaDbRepository::connect(DATABASE_URL)
         .await
         .expect("connect");
+    sqlx::query("UPDATE id_allocator SET block_size = 2 WHERE name = 'client'")
+        .execute(repository.pool())
+        .await
+        .expect("set block size");
+
     let job = "job-repository";
     repository
         .create_job(job, &hash("manifest"))
@@ -178,13 +184,28 @@ async fn mariadb_repository_applies_events_atomically() {
             .await
             .expect("get client")
     );
-    assert_ne!(
-        client,
-        repository
-            .mint_or_get_client("beta", 7)
-            .await
-            .expect("second source")
-    );
+    let other_source = repository
+        .mint_or_get_client("beta", 7)
+        .await
+        .expect("second source");
+    assert_ne!(client, other_source);
+    let third = repository
+        .mint_or_get_client("alpha", 8)
+        .await
+        .expect("renew block");
+    let fourth = repository
+        .mint_or_get_client("alpha", 9)
+        .await
+        .expect("finish block");
+    let mut ids = vec![client, other_source, third, fourth];
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 4);
+    let next_id: i64 = sqlx::query_scalar("SELECT next_id FROM id_allocator WHERE name = 'client'")
+        .fetch_one(repository.pool())
+        .await
+        .expect("next id");
+    assert_eq!(next_id, 5);
 
     let deposit = event(
         job,
@@ -326,4 +347,35 @@ async fn mariadb_repository_applies_events_atomically() {
         .finish_job(job, JobState::Completed, None)
         .await
         .expect("finish job");
+
+    // Concurrent first sightings converge on one canonical ID.
+    let shared = Arc::new(
+        MariaDbRepository::connect(DATABASE_URL)
+            .await
+            .expect("shared connection"),
+    );
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let repository = Arc::clone(&shared);
+        handles.push(tokio::spawn(async move {
+            repository
+                .mint_or_get_client("shared", 1)
+                .await
+                .expect("concurrent mint")
+        }));
+    }
+    let mut concurrent = Vec::new();
+    for handle in handles {
+        concurrent.push(handle.await.expect("join"));
+    }
+    concurrent.sort_unstable();
+    concurrent.dedup();
+    assert_eq!(concurrent.len(), 1);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM clients WHERE source_id = 'shared'",
+    )
+    .fetch_one(shared.pool())
+    .await
+    .expect("client count");
+    assert_eq!(rows, 1);
 }

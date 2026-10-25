@@ -3,18 +3,20 @@
 use async_trait::async_trait;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
+use tokio::sync::Mutex;
 use transaction_processor::{
     apply, Account, Amount, CanonicalClientId, JournalEffect, JournalPolicy,
     LedgerEntry, LedgerTransaction, ProcessingError, TransactionId,
 };
 
 use super::{
-    entry_state_from_str, entry_state_str, AccountRow, ApplyOutcome, JobProgress, JobState,
-    LedgerEvent, LedgerRepository, RepoError, RowJournal, TransactionRow,
+    entry_state_from_str, entry_state_str, retry_transient, AccountRow, ApplyOutcome, IdBlock,
+    JobProgress, JobState, LedgerEvent, LedgerRepository, RepoError, RowJournal, TransactionRow,
 };
 
 pub struct PostgresRepository {
     pool: PgPool,
+    ids: Mutex<IdBlock>,
 }
 
 impl PostgresRepository {
@@ -23,11 +25,17 @@ impl PostgresRepository {
             .max_connections(10)
             .connect(database_url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            ids: Mutex::new(IdBlock::default()),
+        })
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            ids: Mutex::new(IdBlock::default()),
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -72,7 +80,124 @@ impl LedgerRepository for PostgresRepository {
         source_id: &str,
         external_client: u16,
     ) -> Result<CanonicalClientId, RepoError> {
+        retry_transient(|| self.mint_or_get_client_once(source_id, external_client)).await
+    }
+
+    async fn apply_event(&self, event: &LedgerEvent) -> Result<ApplyOutcome, RepoError> {
+        retry_transient(|| self.apply_event_once(event)).await
+    }
+
+    async fn record_emitted(
+        &self,
+        job_id: &str,
+        partition: i32,
+        count: i64,
+    ) -> Result<(), RepoError> {
+        sqlx::query(
+            "INSERT INTO job_progress (job_id, partition_id, emitted, processed) \
+             VALUES ($1, $2, $3, 0) \
+             ON CONFLICT (job_id, partition_id) DO UPDATE SET \
+             emitted = job_progress.emitted + EXCLUDED.emitted",
+        )
+        .bind(job_id)
+        .bind(partition)
+        .bind(count)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn job_progress(&self, job_id: &str) -> Result<Vec<JobProgress>, RepoError> {
+        let rows = sqlx::query(
+            "SELECT partition_id, emitted, processed FROM job_progress \
+             WHERE job_id = $1 ORDER BY partition_id",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(JobProgress {
+                    partition: row.try_get("partition_id")?,
+                    emitted: row.try_get("emitted")?,
+                    processed: row.try_get("processed")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn job_clients(&self, job_id: &str) -> Result<Vec<CanonicalClientId>, RepoError> {
+        let rows = sqlx::query(
+            "SELECT client_id FROM job_clients WHERE job_id = $1 ORDER BY client_id",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| Ok(row.try_get("client_id")?))
+            .collect()
+    }
+
+    async fn accounts_for_job(&self, job_id: &str) -> Result<Vec<AccountRow>, RepoError> {
+        let rows = sqlx::query(
+            "SELECT a.client_id, a.available, a.held, a.locked \
+             FROM job_clients jc JOIN accounts a ON a.client_id = jc.client_id \
+             WHERE jc.job_id = $1 ORDER BY a.client_id",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AccountRow {
+                    client_id: row.try_get("client_id")?,
+                    available: Amount::from_scaled(row.try_get("available")?),
+                    held: Amount::from_scaled(row.try_get("held")?),
+                    locked: row.try_get("locked")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn transaction(
+        &self,
+        tx_id: TransactionId,
+    ) -> Result<Option<TransactionRow>, RepoError> {
+        let row = sqlx::query(
+            "SELECT tx_id, client_id, amount, state FROM transactions WHERE tx_id = $1",
+        )
+        .bind(i64::from(tx_id))
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            let stored: i64 = row.try_get("tx_id")?;
+            let tx_id = TransactionId::try_from(stored)
+                .map_err(|_| RepoError::InvalidState(format!("tx_id {stored} exceeds u32")))?;
+            Ok(TransactionRow {
+                tx_id,
+                client_id: row.try_get("client_id")?,
+                amount: Amount::from_scaled(row.try_get("amount")?),
+                state: entry_state_from_str(row.try_get("state")?)?,
+            })
+        })
+        .transpose()
+    }
+}
+
+impl PostgresRepository {
+    async fn mint_or_get_client_once(
+        &self,
+        source_id: &str,
+        external_client: u16,
+    ) -> Result<CanonicalClientId, RepoError> {
         let external = i32::from(external_client);
+        if let Some(client_id) = self.lookup_client(source_id, external).await? {
+            return Ok(client_id);
+        }
+
+        let client_id = self.next_client_id().await?;
         let mut db = self.pool.begin().await?;
 
         if let Some((client_id,)) = sqlx::query_as::<_, (i64,)>(
@@ -87,13 +212,6 @@ impl LedgerRepository for PostgresRepository {
             db.commit().await?;
             return Ok(client_id);
         }
-
-        let (client_id,) = sqlx::query_as::<_, (i64,)>(
-            "UPDATE id_allocator SET next_id = next_id + 1 \
-             WHERE name = 'client' RETURNING next_id - 1",
-        )
-        .fetch_one(&mut *db)
-        .await?;
 
         let inserted = sqlx::query_as::<_, (i64,)>(
             "INSERT INTO clients (client_id, source_id, external_client) \
@@ -124,7 +242,43 @@ impl LedgerRepository for PostgresRepository {
         Ok(client_id)
     }
 
-    async fn apply_event(&self, event: &LedgerEvent) -> Result<ApplyOutcome, RepoError> {
+    async fn lookup_client(
+        &self,
+        source_id: &str,
+        external: i32,
+    ) -> Result<Option<CanonicalClientId>, RepoError> {
+        sqlx::query_scalar(
+            "SELECT client_id FROM clients \
+             WHERE source_id = $1 AND external_client = $2",
+        )
+        .bind(source_id)
+        .bind(external)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepoError::from)
+    }
+
+    async fn next_client_id(&self) -> Result<CanonicalClientId, RepoError> {
+        let mut block = self.ids.lock().await;
+        if let Some(id) = block.take() {
+            return Ok(id);
+        }
+
+        let (start, size) = sqlx::query_as::<_, (i64, i64)>(
+            "UPDATE id_allocator SET next_id = next_id + block_size \
+             WHERE name = 'client' RETURNING next_id - block_size, block_size",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        *block = IdBlock {
+            next: start + 1,
+            end: start + size,
+        };
+        Ok(start)
+    }
+
+    async fn apply_event_once(&self, event: &LedgerEvent) -> Result<ApplyOutcome, RepoError> {
         let client = event.transaction.client;
         let tx_id = event.transaction.transaction_id;
         let mut db = self.pool.begin().await?;
@@ -283,106 +437,6 @@ impl LedgerRepository for PostgresRepository {
         })
     }
 
-    async fn record_emitted(
-        &self,
-        job_id: &str,
-        partition: i32,
-        count: i64,
-    ) -> Result<(), RepoError> {
-        sqlx::query(
-            "INSERT INTO job_progress (job_id, partition_id, emitted, processed) \
-             VALUES ($1, $2, $3, 0) \
-             ON CONFLICT (job_id, partition_id) DO UPDATE SET \
-             emitted = job_progress.emitted + EXCLUDED.emitted",
-        )
-        .bind(job_id)
-        .bind(partition)
-        .bind(count)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn job_progress(&self, job_id: &str) -> Result<Vec<JobProgress>, RepoError> {
-        let rows = sqlx::query(
-            "SELECT partition_id, emitted, processed FROM job_progress \
-             WHERE job_id = $1 ORDER BY partition_id",
-        )
-        .bind(job_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                Ok(JobProgress {
-                    partition: row.try_get("partition_id")?,
-                    emitted: row.try_get("emitted")?,
-                    processed: row.try_get("processed")?,
-                })
-            })
-            .collect()
-    }
-
-    async fn job_clients(&self, job_id: &str) -> Result<Vec<CanonicalClientId>, RepoError> {
-        let rows = sqlx::query(
-            "SELECT client_id FROM job_clients WHERE job_id = $1 ORDER BY client_id",
-        )
-        .bind(job_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| Ok(row.try_get("client_id")?))
-            .collect()
-    }
-
-    async fn accounts_for_job(&self, job_id: &str) -> Result<Vec<AccountRow>, RepoError> {
-        let rows = sqlx::query(
-            "SELECT a.client_id, a.available, a.held, a.locked \
-             FROM job_clients jc JOIN accounts a ON a.client_id = jc.client_id \
-             WHERE jc.job_id = $1 ORDER BY a.client_id",
-        )
-        .bind(job_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(AccountRow {
-                    client_id: row.try_get("client_id")?,
-                    available: Amount::from_scaled(row.try_get("available")?),
-                    held: Amount::from_scaled(row.try_get("held")?),
-                    locked: row.try_get("locked")?,
-                })
-            })
-            .collect()
-    }
-
-    async fn transaction(
-        &self,
-        tx_id: TransactionId,
-    ) -> Result<Option<TransactionRow>, RepoError> {
-        let row = sqlx::query(
-            "SELECT tx_id, client_id, amount, state FROM transactions WHERE tx_id = $1",
-        )
-        .bind(i64::from(tx_id))
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|row| {
-            let stored: i64 = row.try_get("tx_id")?;
-            let tx_id = TransactionId::try_from(stored)
-                .map_err(|_| RepoError::InvalidState(format!("tx_id {stored} exceeds u32")))?;
-            Ok(TransactionRow {
-                tx_id,
-                client_id: row.try_get("client_id")?,
-                amount: Amount::from_scaled(row.try_get("amount")?),
-                state: entry_state_from_str(row.try_get("state")?)?,
-            })
-        })
-        .transpose()
-    }
-}
-
-impl PostgresRepository {
     async fn update_account(
         &self,
         db: &mut sqlx::Transaction<'_, sqlx::Postgres>,

@@ -19,6 +19,81 @@ pub(crate) struct RowJournal {
     pub(crate) entry: Option<LedgerEntry<CanonicalClientId>>,
 }
 
+/// A process-local block of canonical client IDs reserved from `id_allocator`.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct IdBlock {
+    pub(crate) next: i64,
+    pub(crate) end: i64,
+}
+
+impl IdBlock {
+    pub(crate) fn take(&mut self) -> Option<i64> {
+        if self.next < self.end {
+            let id = self.next;
+            self.next += 1;
+            Some(id)
+        } else {
+            None
+        }
+    }
+}
+
+const MAX_TRANSIENT_ATTEMPTS: u32 = 5;
+
+fn is_transient(error: &sqlx::Error) -> bool {
+    let Some(database) = error.as_database_error() else {
+        return false;
+    };
+    let code = database.code().unwrap_or_default();
+    if matches!(code.as_ref(), "40001" | "40P01" | "1213" | "1205") {
+        return true;
+    }
+    let message = database.message().to_lowercase();
+    message.contains("deadlock") || message.contains("certification")
+}
+
+fn retryable(error: &RepoError) -> bool {
+    match error {
+        RepoError::Database(error) => is_transient(error),
+        RepoError::Transient(_) => true,
+        _ => false,
+    }
+}
+
+/// Retry a transient database operation with bounded exponential backoff.
+///
+/// The operation must be idempotent. `apply_event` dedupes on the ledger event,
+/// and `mint_or_get_client` returns the existing mapping on a retry.
+pub(crate) async fn retry_transient<F, Fut, T>(mut operation: F) -> Result<T, RepoError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, RepoError>>,
+{
+    for attempt in 1..=MAX_TRANSIENT_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) if retryable(&error) && attempt < MAX_TRANSIENT_ATTEMPTS => {
+                let base = 5_u64 * 2_u64.pow(attempt - 1);
+                let jitter = u64::from(attempt) * 3 % 7;
+                tokio::time::sleep(std::time::Duration::from_millis(base + jitter)).await;
+            }
+            Err(error) => {
+                let last = error.to_string();
+                return if retryable(&error) {
+                    Err(RepoError::RetriesExhausted {
+                        attempts: attempt,
+                        last,
+                    })
+                } else {
+                    Err(error)
+                };
+            }
+        }
+    }
+
+    unreachable!("the retry loop always returns")
+}
+
 impl Journal<CanonicalClientId> for RowJournal {
     fn get(&self, id: TransactionId) -> Option<LedgerEntry<CanonicalClientId>> {
         if id == self.tx_id {
@@ -131,6 +206,12 @@ pub enum RepoError {
 
     #[error("job progress is missing for job {job_id} partition {partition}")]
     MissingProgress { job_id: String, partition: i32 },
+
+    #[error("transient database failure: {0}")]
+    Transient(String),
+
+    #[error("transient database failure after {attempts} attempts: {last}")]
+    RetriesExhausted { attempts: u32, last: String },
 }
 
 #[async_trait]
@@ -167,4 +248,50 @@ pub trait LedgerRepository: Send + Sync {
 
     async fn transaction(&self, tx_id: TransactionId)
         -> Result<Option<TransactionRow>, RepoError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn transient_failures_are_retried_until_success() {
+        let attempts = AtomicU32::new(0);
+
+        let value = retry_transient(|| async {
+            let current = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if current < 3 {
+                Err(RepoError::Transient("conflict".to_string()))
+            } else {
+                Ok(current)
+            }
+        })
+        .await
+        .expect("retry succeeds");
+
+        assert_eq!(value, 3);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn transient_failures_exhaust_the_budget() {
+        let attempts = AtomicU32::new(0);
+
+        let result: Result<(), RepoError> = retry_transient(|| async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(RepoError::Transient("conflict".to_string()))
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(RepoError::RetriesExhausted {
+                attempts: 5,
+                ..
+            })
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+    }
 }

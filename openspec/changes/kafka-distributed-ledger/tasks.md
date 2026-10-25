@@ -27,9 +27,9 @@
 - [x] 3.2 Add equivalent MariaDB/Galera migrations with backend-specific types, checks, and indexes.
 - [x] 3.3 Implement the repository trait and PostgreSQL adapter for mint-or-get, account row locking, ledger event insert, transaction lookup/upsert, job progress, job clients, and reporting queries.
 - [x] 3.4 Implement the MariaDB/Galera adapter, owning `ON DUPLICATE KEY UPDATE`, boolean/timestamp mapping, and dialect-specific migration loading.
-- [ ] 3.5 Implement the portable `id_allocator` block allocator with atomic mapping, unique IDs, and acceptable gaps.
-- [ ] 3.6 Implement bounded retry/backoff for PostgreSQL deadlock/serialization and MariaDB/Galera certification conflicts, preserving idempotency.
-- [ ] 3.7 Add repository contract tests on both backends: concurrent mint-or-get, duplicate `tx_id` rejection, account lock/update atomicity, idempotent ledger events, and job progress.
+- [x] 3.5 Implement the portable `id_allocator` block allocator with atomic mapping, unique IDs, and acceptable gaps.
+- [x] 3.6 Implement bounded retry/backoff for PostgreSQL deadlock/serialization and MariaDB/Galera certification conflicts, preserving idempotency.
+- [x] 3.7 Add repository contract tests on both backends: concurrent mint-or-get, duplicate `tx_id` rejection, account lock/update atomicity, idempotent ledger events, and job progress.
 - [ ] 3.8 Add an idempotent `migrate` command that applies migrations and verifies or creates the required topics.
 
 ## 4. Identity, manifest ingestion, and partitioner

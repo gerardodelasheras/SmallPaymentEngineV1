@@ -6,18 +6,20 @@
 use async_trait::async_trait;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::Row;
+use tokio::sync::Mutex;
 use transaction_processor::{
     apply, Account, Amount, CanonicalClientId, EntryState, JournalEffect, JournalPolicy,
     LedgerEntry, LedgerTransaction, ProcessingError, TransactionId,
 };
 
 use super::{
-    entry_state_from_str, entry_state_str, AccountRow, ApplyOutcome, JobProgress, JobState,
-    LedgerEvent, LedgerRepository, RepoError, RowJournal, TransactionRow,
+    entry_state_from_str, entry_state_str, retry_transient, AccountRow, ApplyOutcome, IdBlock,
+    JobProgress, JobState, LedgerEvent, LedgerRepository, RepoError, RowJournal, TransactionRow,
 };
 
 pub struct MariaDbRepository {
     pool: MySqlPool,
+    ids: Mutex<IdBlock>,
 }
 
 impl MariaDbRepository {
@@ -26,11 +28,17 @@ impl MariaDbRepository {
             .max_connections(10)
             .connect(database_url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            ids: Mutex::new(IdBlock::default()),
+        })
     }
 
     pub fn from_pool(pool: MySqlPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            ids: Mutex::new(IdBlock::default()),
+        }
     }
 
     pub fn pool(&self) -> &MySqlPool {
@@ -90,219 +98,11 @@ impl LedgerRepository for MariaDbRepository {
         source_id: &str,
         external_client: u16,
     ) -> Result<CanonicalClientId, RepoError> {
-        let external = i32::from(external_client);
-        let mut db = self.pool.begin().await?;
-
-        if let Some(row) = sqlx::query(
-            "SELECT client_id FROM clients WHERE source_id = ? AND external_client = ?",
-        )
-        .bind(source_id)
-        .bind(external)
-        .fetch_optional(&mut *db)
-        .await?
-        {
-            let client_id = row.try_get("client_id")?;
-            db.commit().await?;
-            return Ok(client_id);
-        }
-
-        let row = sqlx::query(
-            "SELECT next_id FROM id_allocator WHERE name = 'client' FOR UPDATE",
-        )
-        .fetch_one(&mut *db)
-        .await?;
-        let client_id: i64 = row.try_get("next_id")?;
-
-        sqlx::query("UPDATE id_allocator SET next_id = ? WHERE name = 'client'")
-            .bind(client_id + 1)
-            .execute(&mut *db)
-            .await?;
-
-        let inserted = sqlx::query(
-            "INSERT INTO clients (client_id, source_id, external_client) VALUES (?, ?, ?) \
-             ON DUPLICATE KEY UPDATE client_id = client_id",
-        )
-        .bind(client_id)
-        .bind(source_id)
-        .bind(external)
-        .execute(&mut *db)
-        .await?;
-
-        let client_id = if inserted.rows_affected() == 0 {
-            let row = sqlx::query(
-                "SELECT client_id FROM clients WHERE source_id = ? AND external_client = ?",
-            )
-            .bind(source_id)
-            .bind(external)
-            .fetch_one(&mut *db)
-            .await?;
-            row.try_get("client_id")?
-        } else {
-            client_id
-        };
-
-        db.commit().await?;
-        Ok(client_id)
+        retry_transient(|| self.mint_or_get_client_once(source_id, external_client)).await
     }
 
     async fn apply_event(&self, event: &LedgerEvent) -> Result<ApplyOutcome, RepoError> {
-        let client = event.transaction.client;
-        let tx_id = event.transaction.transaction_id;
-        let mut db = self.pool.begin().await?;
-
-        sqlx::query(
-            "INSERT IGNORE INTO accounts (client_id) VALUES (?)",
-        )
-        .bind(client)
-        .execute(&mut *db)
-        .await?;
-
-        let row = sqlx::query(
-            "SELECT available, held, locked FROM accounts WHERE client_id = ? FOR UPDATE",
-        )
-        .bind(client)
-        .fetch_one(&mut *db)
-        .await?;
-
-        let mut account = Account {
-            available: Amount::from_scaled(row.try_get("available")?),
-            held: Amount::from_scaled(row.try_get("held")?),
-            locked: row.try_get::<i8, _>("locked")? != 0,
-        };
-        let was_locked = account.locked;
-
-        let event_inserted = sqlx::query(
-            "INSERT IGNORE INTO ledger_events \
-             (event_id, source_id, file_hash, row_ord, first_job_id) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&event.event_id)
-        .bind(&event.source_id)
-        .bind(&event.file_hash)
-        .bind(event.row_ord)
-        .bind(&event.job_id)
-        .execute(&mut *db)
-        .await?;
-        let duplicate = event_inserted.rows_affected() == 0;
-
-        let job_event_inserted = sqlx::query(
-            "INSERT IGNORE INTO job_events \
-             (job_id, event_id, tx_id, file_ord, row_ord) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&event.job_id)
-        .bind(&event.event_id)
-        .bind(i64::from(tx_id))
-        .bind(event.file_ord)
-        .bind(event.row_ord)
-        .execute(&mut *db)
-        .await?
-        .rows_affected()
-            > 0;
-
-        sqlx::query(
-            "INSERT IGNORE INTO job_clients (job_id, client_id) VALUES (?, ?)",
-        )
-        .bind(&event.job_id)
-        .bind(client)
-        .execute(&mut *db)
-        .await?;
-
-        if job_event_inserted {
-            let updated = sqlx::query(
-                "UPDATE job_progress SET processed = processed + 1 \
-                 WHERE job_id = ? AND partition_id = ?",
-            )
-            .bind(&event.job_id)
-            .bind(event.partition)
-            .execute(&mut *db)
-            .await?;
-            if updated.rows_affected() == 0 {
-                return Err(RepoError::MissingProgress {
-                    job_id: event.job_id.clone(),
-                    partition: event.partition,
-                });
-            }
-        }
-
-        let mut row_error: Option<ProcessingError> = None;
-        if !duplicate {
-            let tx_row = sqlx::query(
-                "SELECT client_id, amount, state FROM transactions WHERE tx_id = ?",
-            )
-            .bind(i64::from(tx_id))
-            .fetch_optional(&mut *db)
-            .await?;
-
-            let journal = RowJournal {
-                tx_id,
-                entry: match tx_row {
-                    Some(row) => Some(LedgerEntry {
-                        client: row.try_get("client_id")?,
-                        amount: Amount::from_scaled(row.try_get("amount")?),
-                        state: state_from_row(&row)?,
-                    }),
-                    None => None,
-                },
-            };
-
-            let ledger_transaction = LedgerTransaction {
-                transaction_type: event.transaction.transaction_type,
-                client,
-                transaction_id: tx_id,
-                amount: event.transaction.amount,
-            };
-
-            match apply(
-                &mut account,
-                &ledger_transaction,
-                &journal,
-                JournalPolicy::RetainChargedBack,
-            ) {
-                Ok(effect) => {
-                    self.update_account(&mut db, client, &account).await?;
-                    match effect {
-                        JournalEffect::Insert(entry) => {
-                            sqlx::query(
-                                "INSERT INTO transactions (tx_id, client_id, amount, state) \
-                                 VALUES (?, ?, ?, ?) \
-                                 ON DUPLICATE KEY UPDATE \
-                                 client_id = VALUES(client_id), \
-                                 amount = VALUES(amount), \
-                                 state = VALUES(state), \
-                                 updated_at = CURRENT_TIMESTAMP(6)",
-                            )
-                            .bind(i64::from(tx_id))
-                            .bind(entry.client)
-                            .bind(entry.amount.scaled())
-                            .bind(entry_state_str(entry.state))
-                            .execute(&mut *db)
-                            .await?;
-                        }
-                        JournalEffect::Remove => {
-                            sqlx::query("DELETE FROM transactions WHERE tx_id = ?")
-                                .bind(i64::from(tx_id))
-                                .execute(&mut *db)
-                                .await?;
-                        }
-                    }
-                }
-                Err(error) => {
-                    row_error = Some(error);
-                    if account.locked != was_locked {
-                        self.update_account(&mut db, client, &account).await?;
-                    }
-                }
-            }
-        }
-
-        db.commit().await?;
-        Ok(ApplyOutcome {
-            duplicate,
-            locked: account.locked,
-            client_id: client,
-            row_error,
-        })
+        retry_transient(|| self.apply_event_once(event)).await
     }
 
     async fn record_emitted(
@@ -403,6 +203,261 @@ impl LedgerRepository for MariaDbRepository {
 }
 
 impl MariaDbRepository {
+    async fn mint_or_get_client_once(
+        &self,
+        source_id: &str,
+        external_client: u16,
+    ) -> Result<CanonicalClientId, RepoError> {
+        let external = i32::from(external_client);
+        if let Some(client_id) = self.lookup_client(source_id, external).await? {
+            return Ok(client_id);
+        }
+
+        let client_id = self.next_client_id().await?;
+        let mut db = self.pool.begin().await?;
+
+        if let Some(row) = sqlx::query(
+            "SELECT client_id FROM clients WHERE source_id = ? AND external_client = ?",
+        )
+        .bind(source_id)
+        .bind(external)
+        .fetch_optional(&mut *db)
+        .await?
+        {
+            let client_id = row.try_get("client_id")?;
+            db.commit().await?;
+            return Ok(client_id);
+        }
+
+        let inserted = sqlx::query(
+            "INSERT IGNORE INTO clients (client_id, source_id, external_client) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(client_id)
+        .bind(source_id)
+        .bind(external)
+        .execute(&mut *db)
+        .await?;
+
+        let client_id = if inserted.rows_affected() == 0 {
+            // A locking read sees the row committed by the winning transaction,
+            // even under MariaDB's default REPEATABLE READ snapshot.
+            let row = sqlx::query(
+                "SELECT client_id FROM clients \
+                 WHERE source_id = ? AND external_client = ? FOR UPDATE",
+            )
+            .bind(source_id)
+            .bind(external)
+            .fetch_one(&mut *db)
+            .await?;
+            row.try_get("client_id")?
+        } else {
+            client_id
+        };
+
+        db.commit().await?;
+        Ok(client_id)
+    }
+
+    async fn lookup_client(
+        &self,
+        source_id: &str,
+        external: i32,
+    ) -> Result<Option<CanonicalClientId>, RepoError> {
+        let row = sqlx::query(
+            "SELECT client_id FROM clients WHERE source_id = ? AND external_client = ?",
+        )
+        .bind(source_id)
+        .bind(external)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| Ok(row.try_get("client_id")?)).transpose()
+    }
+
+    async fn next_client_id(&self) -> Result<CanonicalClientId, RepoError> {
+        let mut block = self.ids.lock().await;
+        if let Some(id) = block.take() {
+            return Ok(id);
+        }
+
+        let mut db = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT next_id, block_size FROM id_allocator WHERE name = 'client' FOR UPDATE",
+        )
+        .fetch_one(&mut *db)
+        .await?;
+        let start: i64 = row.try_get("next_id")?;
+        let size: i64 = row.try_get("block_size")?;
+
+        sqlx::query("UPDATE id_allocator SET next_id = ? WHERE name = 'client'")
+            .bind(start + size)
+            .execute(&mut *db)
+            .await?;
+        db.commit().await?;
+
+        *block = IdBlock {
+            next: start + 1,
+            end: start + size,
+        };
+        Ok(start)
+    }
+
+    async fn apply_event_once(&self, event: &LedgerEvent) -> Result<ApplyOutcome, RepoError> {
+        let client = event.transaction.client;
+        let tx_id = event.transaction.transaction_id;
+        let mut db = self.pool.begin().await?;
+
+        sqlx::query("INSERT IGNORE INTO accounts (client_id) VALUES (?)")
+            .bind(client)
+            .execute(&mut *db)
+            .await?;
+
+        let row = sqlx::query(
+            "SELECT available, held, locked FROM accounts WHERE client_id = ? FOR UPDATE",
+        )
+        .bind(client)
+        .fetch_one(&mut *db)
+        .await?;
+
+        let mut account = Account {
+            available: Amount::from_scaled(row.try_get("available")?),
+            held: Amount::from_scaled(row.try_get("held")?),
+            locked: row.try_get::<i8, _>("locked")? != 0,
+        };
+        let was_locked = account.locked;
+
+        let event_inserted = sqlx::query(
+            "INSERT IGNORE INTO ledger_events \
+             (event_id, source_id, file_hash, row_ord, first_job_id) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&event.event_id)
+        .bind(&event.source_id)
+        .bind(&event.file_hash)
+        .bind(event.row_ord)
+        .bind(&event.job_id)
+        .execute(&mut *db)
+        .await?;
+        let duplicate = event_inserted.rows_affected() == 0;
+
+        let job_event_inserted = sqlx::query(
+            "INSERT IGNORE INTO job_events \
+             (job_id, event_id, tx_id, file_ord, row_ord) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&event.job_id)
+        .bind(&event.event_id)
+        .bind(i64::from(tx_id))
+        .bind(event.file_ord)
+        .bind(event.row_ord)
+        .execute(&mut *db)
+        .await?
+        .rows_affected()
+            > 0;
+
+        sqlx::query("INSERT IGNORE INTO job_clients (job_id, client_id) VALUES (?, ?)")
+            .bind(&event.job_id)
+            .bind(client)
+            .execute(&mut *db)
+            .await?;
+
+        if job_event_inserted {
+            let updated = sqlx::query(
+                "UPDATE job_progress SET processed = processed + 1 \
+                 WHERE job_id = ? AND partition_id = ?",
+            )
+            .bind(&event.job_id)
+            .bind(event.partition)
+            .execute(&mut *db)
+            .await?;
+            if updated.rows_affected() == 0 {
+                return Err(RepoError::MissingProgress {
+                    job_id: event.job_id.clone(),
+                    partition: event.partition,
+                });
+            }
+        }
+
+        let mut row_error: Option<ProcessingError> = None;
+        if !duplicate {
+            let tx_row = sqlx::query(
+                "SELECT client_id, amount, state FROM transactions WHERE tx_id = ?",
+            )
+            .bind(i64::from(tx_id))
+            .fetch_optional(&mut *db)
+            .await?;
+
+            let journal = RowJournal {
+                tx_id,
+                entry: match tx_row {
+                    Some(row) => Some(LedgerEntry {
+                        client: row.try_get("client_id")?,
+                        amount: Amount::from_scaled(row.try_get("amount")?),
+                        state: state_from_row(&row)?,
+                    }),
+                    None => None,
+                },
+            };
+
+            let ledger_transaction = LedgerTransaction {
+                transaction_type: event.transaction.transaction_type,
+                client,
+                transaction_id: tx_id,
+                amount: event.transaction.amount,
+            };
+
+            match apply(
+                &mut account,
+                &ledger_transaction,
+                &journal,
+                JournalPolicy::RetainChargedBack,
+            ) {
+                Ok(effect) => {
+                    self.update_account(&mut db, client, &account).await?;
+                    match effect {
+                        JournalEffect::Insert(entry) => {
+                            sqlx::query(
+                                "INSERT INTO transactions (tx_id, client_id, amount, state) \
+                                 VALUES (?, ?, ?, ?) \
+                                 ON DUPLICATE KEY UPDATE \
+                                 client_id = VALUES(client_id), \
+                                 amount = VALUES(amount), \
+                                 state = VALUES(state), \
+                                 updated_at = CURRENT_TIMESTAMP(6)",
+                            )
+                            .bind(i64::from(tx_id))
+                            .bind(entry.client)
+                            .bind(entry.amount.scaled())
+                            .bind(entry_state_str(entry.state))
+                            .execute(&mut *db)
+                            .await?;
+                        }
+                        JournalEffect::Remove => {
+                            sqlx::query("DELETE FROM transactions WHERE tx_id = ?")
+                                .bind(i64::from(tx_id))
+                                .execute(&mut *db)
+                                .await?;
+                        }
+                    }
+                }
+                Err(error) => {
+                    row_error = Some(error);
+                    if account.locked != was_locked {
+                        self.update_account(&mut db, client, &account).await?;
+                    }
+                }
+            }
+        }
+
+        db.commit().await?;
+        Ok(ApplyOutcome {
+            duplicate,
+            locked: account.locked,
+            client_id: client,
+            row_error,
+        })
+    }
+
     async fn update_account(
         &self,
         db: &mut sqlx::Transaction<'_, sqlx::MySql>,
