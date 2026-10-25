@@ -116,9 +116,9 @@ Then the row is skipped
 And no account is initialized for that client
 ```
 
-### Requirement: Amounts render canonically
+### Requirement: Amounts render canonically with defensive minus signs
 
-The system SHALL render a scaled amount as decimal text with trailing fractional zeros removed and at least one fractional digit, preserving a leading minus sign for negative balances.
+The system SHALL render a scaled amount as decimal text with trailing fractional zeros removed and at least one fractional digit. Negative scaled values SHALL render with a leading minus sign as defensive formatter behavior, although the ledger no longer produces them.
 
 #### Scenario: Zero renders with one decimal place
 
@@ -137,18 +137,6 @@ Given a new client deposits 10.0
 And the client disputes the deposit
 When the accounts are written
 Then the client's held is 10.0
-```
-
-#### Scenario: A negative available balance renders with its sign
-
-```gherkin
-Given a new client deposits 100.0
-And the client withdraws 80.0
-And the client disputes the deposit
-When the accounts are written
-Then the client's available is -80.0
-And the client's held is 100.0
-And the client's total is 20.0
 ```
 
 #### Scenario: A one-unit fraction renders at full precision
