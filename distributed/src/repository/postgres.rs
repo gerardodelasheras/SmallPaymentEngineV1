@@ -4,13 +4,13 @@ use async_trait::async_trait;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 use transaction_processor::{
-    apply, Account, Amount, CanonicalClientId, EntryState, Journal, JournalEffect,
-    JournalPolicy, LedgerEntry, LedgerTransaction, ProcessingError, TransactionId,
+    apply, Account, Amount, CanonicalClientId, JournalEffect, JournalPolicy,
+    LedgerEntry, LedgerTransaction, ProcessingError, TransactionId,
 };
 
 use super::{
-    AccountRow, ApplyOutcome, JobProgress, JobState, LedgerEvent, LedgerRepository, RepoError,
-    TransactionRow,
+    entry_state_from_str, entry_state_str, AccountRow, ApplyOutcome, JobProgress, JobState,
+    LedgerEvent, LedgerRepository, RepoError, RowJournal, TransactionRow,
 };
 
 pub struct PostgresRepository {
@@ -32,38 +32,6 @@ impl PostgresRepository {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
-    }
-}
-
-struct RowJournal {
-    tx_id: TransactionId,
-    entry: Option<LedgerEntry<CanonicalClientId>>,
-}
-
-impl Journal<CanonicalClientId> for RowJournal {
-    fn get(&self, id: TransactionId) -> Option<LedgerEntry<CanonicalClientId>> {
-        if id == self.tx_id {
-            self.entry
-        } else {
-            None
-        }
-    }
-}
-
-fn state_from_str(state: &str) -> Result<EntryState, RepoError> {
-    match state {
-        "settled" => Ok(EntryState::Settled),
-        "disputed" => Ok(EntryState::Disputed),
-        "charged_back" => Ok(EntryState::ChargedBack),
-        other => Err(RepoError::InvalidState(other.to_string())),
-    }
-}
-
-fn state_str(state: EntryState) -> &'static str {
-    match state {
-        EntryState::Settled => "settled",
-        EntryState::Disputed => "disputed",
-        EntryState::ChargedBack => "charged_back",
     }
 }
 
@@ -250,7 +218,7 @@ impl LedgerRepository for PostgresRepository {
                     Some(row) => Some(LedgerEntry {
                         client: row.try_get("client_id")?,
                         amount: Amount::from_scaled(row.try_get("amount")?),
-                        state: state_from_str(row.try_get("state")?)?,
+                        state: entry_state_from_str(row.try_get("state")?)?,
                     }),
                     None => None,
                 },
@@ -285,7 +253,7 @@ impl LedgerRepository for PostgresRepository {
                             .bind(i64::from(tx_id))
                             .bind(entry.client)
                             .bind(entry.amount.scaled())
-                            .bind(state_str(entry.state))
+                            .bind(entry_state_str(entry.state))
                             .execute(&mut *db)
                             .await?;
                         }
@@ -407,7 +375,7 @@ impl LedgerRepository for PostgresRepository {
                 tx_id,
                 client_id: row.try_get("client_id")?,
                 amount: Amount::from_scaled(row.try_get("amount")?),
-                state: state_from_str(row.try_get("state")?)?,
+                state: entry_state_from_str(row.try_get("state")?)?,
             })
         })
         .transpose()

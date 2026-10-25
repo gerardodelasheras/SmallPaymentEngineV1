@@ -5,12 +5,46 @@
 //! rules, journal update, job progress, and touched-client tracking commit
 //! together.
 
+pub mod mariadb;
 pub mod postgres;
 
 use async_trait::async_trait;
 use transaction_processor::{
-    Amount, CanonicalClientId, EntryState, LedgerTransaction, ProcessingError, TransactionId,
+    Amount, CanonicalClientId, EntryState, Journal, LedgerEntry, LedgerTransaction,
+    ProcessingError, TransactionId,
 };
+
+pub(crate) struct RowJournal {
+    pub(crate) tx_id: TransactionId,
+    pub(crate) entry: Option<LedgerEntry<CanonicalClientId>>,
+}
+
+impl Journal<CanonicalClientId> for RowJournal {
+    fn get(&self, id: TransactionId) -> Option<LedgerEntry<CanonicalClientId>> {
+        if id == self.tx_id {
+            self.entry
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) fn entry_state_from_str(state: &str) -> Result<EntryState, RepoError> {
+    match state {
+        "settled" => Ok(EntryState::Settled),
+        "disputed" => Ok(EntryState::Disputed),
+        "charged_back" => Ok(EntryState::ChargedBack),
+        other => Err(RepoError::InvalidState(other.to_string())),
+    }
+}
+
+pub(crate) fn entry_state_str(state: EntryState) -> &'static str {
+    match state {
+        EntryState::Settled => "settled",
+        EntryState::Disputed => "disputed",
+        EntryState::ChargedBack => "charged_back",
+    }
+}
 
 /// A ledger event ready for atomic application.
 #[derive(Debug, Clone)]
