@@ -655,7 +655,14 @@ class DistributedHarness:
     def run_conformance_both(self):
         for backend in ("postgres", "mariadb"):
             self.ensure_backend_running(backend)
-            self.run_ledger_job(job_name=f"conformance-{backend}", backend=backend)
+            result = self.run_ledger_job(
+                job_name=f"conformance-{backend}", backend=backend
+            )
+            if result.status != ACCEPTED:
+                raise AssertionError(
+                    f"the {backend} conformance job did not complete: "
+                    f"{result.status}: {result.failure_reason}"
+                )
             self.run_on_backend(backend)
         return self.backend_runs
 
@@ -678,7 +685,12 @@ class DistributedHarness:
             args = ["migrate", "--backend", backend, "--json"]
             if fresh:
                 args.append("--fresh")
-            results[backend] = self._run(args)
+            completed = self._run(args, backend=backend)
+            if completed.returncode != EXIT_OK:
+                raise AssertionError(
+                    f"{backend} migration failed: {completed.stderr.strip()}"
+                )
+            results[backend] = completed
         return results
 
     def table_exists(self, table, backend):

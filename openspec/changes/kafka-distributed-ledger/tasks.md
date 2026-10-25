@@ -30,11 +30,11 @@
 - [x] 3.5 Implement the portable `id_allocator` block allocator with atomic mapping, unique IDs, and acceptable gaps.
 - [x] 3.6 Implement bounded retry/backoff for PostgreSQL deadlock/serialization and MariaDB/Galera certification conflicts, preserving idempotency.
 - [x] 3.7 Add repository contract tests on both backends: concurrent mint-or-get, duplicate `tx_id` rejection, account lock/update atomicity, idempotent ledger events, and job progress.
-- [ ] 3.8 Add an idempotent `migrate` command that applies migrations and verifies or creates the required topics.
+- [x] 3.8 Add an idempotent `migrate` command that applies migrations and verifies or creates the required topics.
 
 ## 4. Identity, manifest ingestion, and partitioner
 
-- [ ] 4.1 Implement `mint_or_get` for `(source_id, external_client: u16)` and prove concurrent first sightings converge on one canonical ID.
+- [x] 4.1 Implement `mint_or_get` for `(source_id, external_client: u16)` and prove concurrent first sightings converge on one canonical ID.
 - [ ] 4.2 Define and validate the manifest model: source, unique ordinal, hash, location, duplicate/missing/hash-mismatch handling, and manifest hash identity.
 - [ ] 4.3 Implement bounded parallel ingestion using the shared CSV parser; stage the parsed transaction plus `(job_id, source_id, external_client, file_ord, row_ord, event_id)`; handle malformed rows without stopping the file.
 - [ ] 4.4 Produce staging records keyed by source-scoped external key with an idempotent producer; flush before marking a file complete.

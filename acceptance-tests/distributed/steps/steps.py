@@ -903,6 +903,7 @@ def step_manifest_completed(context):
     h.subject = 42
     h.deposit(h.subject, "10.0")
     h.run_ledger_job()
+    accepted(context)
     h.export_snapshot = dict(h.accounts)
     h.journal_snapshot = h.journal_count()
 
@@ -911,6 +912,7 @@ def step_manifest_completed(context):
 def step_same_manifest_again(context):
     h = harness(context)
     h.run_ledger_job()
+    accepted(context)
 
 
 @both("the exported balances are unchanged")

@@ -5,6 +5,7 @@
 //! delete-on-chargeback behaviour, so `JournalPolicy` is the only divergence
 //! between the two adapters.
 
+pub mod migrate;
 pub mod repository;
 
 use std::collections::HashMap;
