@@ -23,8 +23,8 @@
 
 ## 3. Database schema and repository contract
 
-- [ ] 3.1 Add PostgreSQL migrations for `clients`, `accounts`, `transactions`, `ledger_events`, `jobs`, `job_files`, `job_events`, `job_progress`, `job_clients`, `id_allocator`, and the job lock; include the global `tx_id` unique index and account checks.
-- [ ] 3.2 Add equivalent MariaDB/Galera migrations with backend-specific types, checks, and indexes.
+- [x] 3.1 Add PostgreSQL migrations for `clients`, `accounts`, `transactions`, `ledger_events`, `jobs`, `job_files`, `job_events`, `job_progress`, `job_clients`, `id_allocator`, and the job lock; include the global `tx_id` unique index and account checks.
+- [x] 3.2 Add equivalent MariaDB/Galera migrations with backend-specific types, checks, and indexes.
 - [ ] 3.3 Implement the repository trait and PostgreSQL adapter for mint-or-get, account row locking, ledger event insert, transaction lookup/upsert, job progress, job clients, and reporting queries.
 - [ ] 3.4 Implement the MariaDB/Galera adapter, owning `ON DUPLICATE KEY UPDATE`, boolean/timestamp mapping, and dialect-specific migration loading.
 - [ ] 3.5 Implement the portable `id_allocator` block allocator with atomic mapping, unique IDs, and acceptable gaps.
