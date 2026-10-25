@@ -7,6 +7,7 @@ pub mod ledger;
 pub mod pipeline;
 
 pub use account::account::Account;
+pub use amount::Amount;
 pub use client::client_id::{CanonicalClientId, ClientId};
 pub use ledger::{
     apply, EntryState, Journal, JournalEffect, JournalPolicy, LedgerEntry, LedgerId,

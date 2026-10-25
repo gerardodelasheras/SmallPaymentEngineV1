@@ -38,7 +38,7 @@ CREATE INDEX IF NOT EXISTS transactions_client_id_idx
 
 CREATE TABLE IF NOT EXISTS jobs (
     job_id VARCHAR(64) PRIMARY KEY,
-    manifest_hash CHAR(64) NOT NULL,
+    manifest_hash VARCHAR(64) NOT NULL,
     state VARCHAR(16) NOT NULL
         CHECK (state IN ('running', 'completed', 'failed', 'rejected')),
     failure_reason TEXT,
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS job_files (
     job_id VARCHAR(64) NOT NULL REFERENCES jobs (job_id),
     source_id VARCHAR(128) NOT NULL,
     file_ord INTEGER NOT NULL CHECK (file_ord >= 0),
-    file_hash CHAR(64) NOT NULL,
+    file_hash VARCHAR(64) NOT NULL,
     location TEXT NOT NULL,
     state VARCHAR(16) NOT NULL
         CHECK (state IN ('pending', 'staged', 'complete', 'failed')),
@@ -63,9 +63,9 @@ CREATE TABLE IF NOT EXISTS job_files (
 );
 
 CREATE TABLE IF NOT EXISTS ledger_events (
-    event_id CHAR(64) PRIMARY KEY,
+    event_id VARCHAR(64) PRIMARY KEY,
     source_id VARCHAR(128) NOT NULL,
-    file_hash CHAR(64) NOT NULL,
+    file_hash VARCHAR(64) NOT NULL,
     row_ord INTEGER NOT NULL CHECK (row_ord >= 0),
     first_job_id VARCHAR(64) NOT NULL REFERENCES jobs (job_id),
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS ledger_events (
 
 CREATE TABLE IF NOT EXISTS job_events (
     job_id VARCHAR(64) NOT NULL REFERENCES jobs (job_id),
-    event_id CHAR(64) NOT NULL REFERENCES ledger_events (event_id),
+    event_id VARCHAR(64) NOT NULL REFERENCES ledger_events (event_id),
     tx_id BIGINT,
     file_ord INTEGER NOT NULL,
     row_ord INTEGER NOT NULL,
@@ -85,10 +85,10 @@ CREATE TABLE IF NOT EXISTS job_events (
 
 CREATE TABLE IF NOT EXISTS job_progress (
     job_id VARCHAR(64) NOT NULL REFERENCES jobs (job_id),
-    partition INTEGER NOT NULL CHECK (partition >= 0),
+    partition_id INTEGER NOT NULL CHECK (partition_id >= 0),
     emitted BIGINT NOT NULL DEFAULT 0 CHECK (emitted >= 0),
     processed BIGINT NOT NULL DEFAULT 0 CHECK (processed >= 0),
-    PRIMARY KEY (job_id, partition),
+    PRIMARY KEY (job_id, partition_id),
     CONSTRAINT job_progress_processed_le_emitted CHECK (processed <= emitted)
 );
 

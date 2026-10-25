@@ -6,3 +6,10 @@ description = "Kafka-backed distributed ledger variant"
 
 [dependencies]
 transaction_processor = { path = ".." }
+async-trait = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-none", "postgres", "mysql"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

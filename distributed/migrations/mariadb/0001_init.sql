@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS transactions (
 
 CREATE TABLE IF NOT EXISTS jobs (
     job_id VARCHAR(64) NOT NULL,
-    manifest_hash CHAR(64) NOT NULL,
+    manifest_hash VARCHAR(64) NOT NULL,
     state VARCHAR(16) NOT NULL,
     failure_reason TEXT,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS job_files (
     job_id VARCHAR(64) NOT NULL,
     source_id VARCHAR(128) NOT NULL,
     file_ord INT NOT NULL,
-    file_hash CHAR(64) NOT NULL,
+    file_hash VARCHAR(64) NOT NULL,
     location TEXT NOT NULL,
     state VARCHAR(16) NOT NULL,
     row_count INT NOT NULL DEFAULT 0,
@@ -80,9 +80,9 @@ CREATE TABLE IF NOT EXISTS job_files (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 CREATE TABLE IF NOT EXISTS ledger_events (
-    event_id CHAR(64) NOT NULL,
+    event_id VARCHAR(64) NOT NULL,
     source_id VARCHAR(128) NOT NULL,
-    file_hash CHAR(64) NOT NULL,
+    file_hash VARCHAR(64) NOT NULL,
     row_ord INT NOT NULL,
     first_job_id VARCHAR(64) NOT NULL,
     applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS ledger_events (
 
 CREATE TABLE IF NOT EXISTS job_events (
     job_id VARCHAR(64) NOT NULL,
-    event_id CHAR(64) NOT NULL,
+    event_id VARCHAR(64) NOT NULL,
     tx_id BIGINT,
     file_ord INT NOT NULL,
     row_ord INT NOT NULL,
