@@ -48,8 +48,11 @@ Common options:
 
 migrate options:
   --staging-topic <name>         Staging topic to provision (default: staging)
-  --fresh                        Reset the schema first (test/teardown only)
-  --fresh-topics                 Also recreate the default Kafka topics
+  --staging-partitions <n>       Default: 3
+  --transactions-partitions <n>  Default: 3 (changing this rekeys clients)
+  --dlq-partitions <n>           Default: 1
+  --fresh                        Reset the schema only (test/teardown only)
+  --fresh-topics                 Also recreate the topics with these counts
 
 ingest options:
   --manifest <path>              Manifest JSON (required)
@@ -195,6 +198,7 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
     let mut database_url = env::var("DATABASE_URL").ok();
     let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
     let mut staging_topic = "staging".to_string();
+    let mut partitions = TopicPartitions::default();
     let mut json = false;
     let mut fresh = false;
     let mut fresh_topics = false;
@@ -236,6 +240,27 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
                 staging_topic = take_value(args, &mut index)
                     .map_err(|error| MigrateError::Config(error.to_string()))?;
             }
+            "--staging-partitions" => {
+                partitions.staging = parse_partition_count(
+                    &take_value(args, &mut index)
+                        .map_err(|error| MigrateError::Config(error.to_string()))?,
+                    "--staging-partitions",
+                )?;
+            }
+            "--transactions-partitions" => {
+                partitions.transactions = parse_partition_count(
+                    &take_value(args, &mut index)
+                        .map_err(|error| MigrateError::Config(error.to_string()))?,
+                    "--transactions-partitions",
+                )?;
+            }
+            "--dlq-partitions" => {
+                partitions.dlq = parse_partition_count(
+                    &take_value(args, &mut index)
+                        .map_err(|error| MigrateError::Config(error.to_string()))?,
+                    "--dlq-partitions",
+                )?;
+            }
             other => {
                 return Err(MigrateError::Config(format!(
                     "unknown migrate option '{other}'"
@@ -251,21 +276,28 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
         MigrateError::Config("KAFKA_BOOTSTRAP or --kafka-bootstrap is required".to_string())
     })?;
 
+    let names = TopicNames {
+        staging: staging_topic,
+        ..TopicNames::default()
+    };
     let report = if fresh_topics {
-        run_fresh_with_topics(backend, &database_url, &kafka_bootstrap).await?
+        run_fresh_with_topics(
+            backend,
+            &database_url,
+            &kafka_bootstrap,
+            &names,
+            partitions,
+        )
+        .await?
     } else if fresh {
         run_fresh(backend, &database_url, &kafka_bootstrap).await?
     } else {
-        let names = TopicNames {
-            staging: staging_topic,
-            ..TopicNames::default()
-        };
         run_with_topics(
             backend,
             &database_url,
             &kafka_bootstrap,
             &names,
-            TopicPartitions::default(),
+            partitions,
         )
         .await?
     };
@@ -281,6 +313,18 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
         );
     }
     Ok(())
+}
+
+fn parse_partition_count(value: &str, option: &str) -> Result<i32, MigrateError> {
+    let count = value.parse::<i32>().map_err(|_| {
+        MigrateError::Config(format!("{option} must be a positive integer"))
+    })?;
+    if count < 1 {
+        return Err(MigrateError::Config(format!(
+            "{option} must be at least 1"
+        )));
+    }
+    Ok(count)
 }
 
 fn manifest_file_hash(path: &str) -> String {

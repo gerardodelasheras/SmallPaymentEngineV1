@@ -3,11 +3,13 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use distributed::migrate::{
     run_fresh, run_with_topics, Backend, TopicNames, TopicPartitions,
 };
+use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 
 const KAFKA_BOOTSTRAP: &str = "localhost:9092";
 
@@ -143,6 +145,22 @@ fn topic_names(label: &str) -> TopicNames {
     }
 }
 
+fn kafka_partition_count(topic: &str) -> usize {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", KAFKA_BOOTSTRAP)
+        .create()
+        .expect("metadata consumer");
+    let metadata = consumer
+        .fetch_metadata(Some(topic), Duration::from_secs(5))
+        .expect("fetch metadata");
+    metadata
+        .topics()
+        .iter()
+        .find(|candidate| candidate.name() == topic)
+        .map(|candidate| candidate.partitions().len())
+        .unwrap_or(0)
+}
+
 fn assert_idempotent(report_backend: &str, first: &distributed::migrate::MigrateReport, second: &distributed::migrate::MigrateReport) {
     assert_eq!(first.backend, report_backend);
     assert_eq!(first.migrations_applied, 1);
@@ -190,6 +208,25 @@ async fn postgres_migrate_is_idempotent() {
     .await
     .expect("fresh migration");
     assert_eq!(fresh.migrations_applied, 1);
+
+    let names = topic_names("pg-partitions");
+    let partitions = TopicPartitions {
+        staging: 1,
+        transactions: 2,
+        dlq: 1,
+    };
+    run_with_topics(
+        Backend::Postgres,
+        "postgres://ledger:ledger@localhost:5432/ledger_migrate_test",
+        KAFKA_BOOTSTRAP,
+        &names,
+        partitions,
+    )
+    .await
+    .expect("custom partition counts");
+    assert_eq!(kafka_partition_count(&names.staging), 1);
+    assert_eq!(kafka_partition_count(&names.transactions), 2);
+    assert_eq!(kafka_partition_count(&names.dlq), 1);
 }
 
 #[tokio::test]

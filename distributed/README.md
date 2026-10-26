@@ -88,6 +88,27 @@ target/debug/distributed partition --job job-1 --drain --expect 100 --json
 `worker` and `export` are implemented by the remaining tasks in
 `openspec/changes/kafka-distributed-ledger/tasks.md`.
 
+## Topic partition counts
+
+```sh
+target/debug/distributed migrate --backend postgres \
+  --staging-partitions 6 \
+  --transactions-partitions 12 \
+  --dlq-partitions 1 --json
+```
+
+| Topic | Controls | Guidance |
+|---|---|---|
+| `staging` | Partitioner parallelism | More partitions allow more partitioner replicas. Clients hash across partitions; many clients share one partition. |
+| `transactions` | Worker parallelism | **Choose before ingesting.** Producers key by canonical client ID, so changing the count changes the client-to-partition mapping. |
+| `dlq` | Dead-letter parallelism | 1 is enough for the test scenario; size for operator volume. |
+
+Changing `--transactions-partitions` **rekeys canonical clients**. Because a
+client's events must stay on one partition for ordering and single ownership,
+changing the count requires stopping ingestion, draining in-flight work, and a
+controlled rekey/migration. `--fresh-topics` recreates the topics with the
+supplied counts and is destructive.
+
 ## Kafka semantics
 
 - **Producers** use `enable.idempotence=true` and `acks=all`.

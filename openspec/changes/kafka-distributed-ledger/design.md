@@ -231,6 +231,7 @@ Alternatives considered:
 - `staging` topic: keyed by `source_id + external_client`, partitioned for parallel ingestion; it carries parsed transaction payloads and job/file/row coordinates.
 - `transactions` topic: keyed by canonical `client_id`; partition count is chosen high before ingestion because increasing it rekeys clients.
 - `DLQ` topic: carries exhausted events with metadata.
+- `migrate` exposes `--staging-partitions`, `--transactions-partitions`, and `--dlq-partitions`. The `transactions` count is fixed before ingestion because changing it rekeys canonical clients.
 - DB watermarks, not a single control topic, are the ordering source; file completion is durable and queryable.
 - Workers use a consumer group; partition ownership gives one worker per transaction partition. The partitioner uses staging partition ownership so each source-scoped client is owned by exactly one partitioner replica at a time. Many clients share a staging partition, and one replica may own several partitions; the partition count is a fixed parallelism knob, not a per-client count.
 

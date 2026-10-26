@@ -147,8 +147,9 @@ pub async fn run_fresh_with_topics(
     backend: Backend,
     database_url: &str,
     kafka_bootstrap: &str,
+    names: &TopicNames,
+    partitions: TopicPartitions,
 ) -> Result<MigrateReport, MigrateError> {
-    let names = TopicNames::default();
     let topics = [
         names.staging.as_str(),
         names.transactions.as_str(),
@@ -156,7 +157,14 @@ pub async fn run_fresh_with_topics(
     ];
     delete_topics(kafka_bootstrap, &topics).await?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    run_fresh(backend, database_url, kafka_bootstrap).await
+    run_with_topics(
+        backend,
+        database_url,
+        kafka_bootstrap,
+        names,
+        partitions,
+    )
+    .await
 }
 
 async fn delete_topics(
