@@ -6,22 +6,21 @@
 //! and the durable ledger dedupes it.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
-use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::util::Timeout;
+use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
+use tokio::sync::Mutex;
 
-use crate::ingest::{IngestError, StagingRecord, StagingSink};
-use crate::repository::LedgerRepository;
+use crate::ingest::{FileCompletion, IngestError, StagingRecord, StagingSink};
+use crate::repository::{FileCompletionRow, LedgerRepository};
 
 const CLIENT_ID: &str = "distributed-ingest";
-const PRODUCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct KafkaStagingSink {
     producer: FutureProducer,
     topic: String,
+    pending: Mutex<Vec<DeliveryFuture>>,
     repository: Arc<dyn LedgerRepository>,
 }
 
@@ -47,6 +46,7 @@ impl KafkaStagingSink {
         Ok(Self {
             producer,
             topic: topic.to_string(),
+            pending: Mutex::new(Vec::new()),
             repository,
         })
     }
@@ -60,32 +60,60 @@ impl StagingSink for KafkaStagingSink {
             IngestError::Staging(format!("serialize staging record: {error}"))
         })?;
 
-        let delivery = self
+        let future = self
             .producer
-            .send(
+            .send_result(
                 FutureRecord::to(&self.topic)
                     .key(key.as_bytes())
                     .payload(value.as_slice()),
-                Timeout::After(PRODUCE_TIMEOUT),
             )
-            .await;
-
-        delivery.map_err(|(error, _message)| {
-            IngestError::Staging(format!("produce to staging topic: {error}"))
-        })?;
+            .map_err(|(error, _message)| {
+                IngestError::Staging(format!("queue staging record: {error}"))
+            })?;
+        self.pending.lock().await.push(future);
         Ok(())
     }
 
-    async fn complete_file(
+    async fn complete_files(
         &self,
         job_id: &str,
-        source_id: &str,
-        file_ord: u32,
-        row_count: u64,
+        files: &[FileCompletion],
     ) -> Result<(), IngestError> {
+        // Flush every queued record before any file in this batch is marked
+        // complete. This preserves "flush before complete" while allowing the
+        // producer to batch thousands of rows.
+        let pending = {
+            let mut pending = self.pending.lock().await;
+            std::mem::take(&mut *pending)
+        };
+        for future in pending {
+            match future.await {
+                Ok(Ok(_)) => {}
+                Ok(Err((error, _message))) => {
+                    return Err(IngestError::Staging(format!(
+                        "deliver staging record: {error}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(IngestError::Staging(
+                        "staging delivery future was cancelled".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let rows: Vec<FileCompletionRow> = files
+            .iter()
+            .map(|file| FileCompletionRow {
+                source_id: file.source_id.clone(),
+                file_ord: file.file_ord,
+                row_count: file.row_count,
+            })
+            .collect();
         self.repository
-            .mark_file_complete(job_id, source_id, file_ord, row_count)
+            .mark_files_complete(job_id, &rows)
             .await
-            .map_err(|error| IngestError::Staging(error.to_string()))
+            .map_err(|error| IngestError::Staging(error.to_string()))?;
+        Ok(())
     }
 }

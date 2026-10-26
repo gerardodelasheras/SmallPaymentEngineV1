@@ -190,7 +190,6 @@ async fn postgres_migrate_is_idempotent() {
     .await
     .expect("fresh migration");
     assert_eq!(fresh.migrations_applied, 1);
-    assert_eq!(fresh.topics_created, 3);
 }
 
 #[tokio::test]
@@ -231,5 +230,4 @@ async fn mariadb_migrate_is_idempotent() {
     .await
     .expect("fresh migration");
     assert_eq!(fresh.migrations_applied, 1);
-    assert_eq!(fresh.topics_created, 3);
 }

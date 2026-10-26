@@ -69,8 +69,11 @@ Command-line flags override the environment variables.
 # Apply the schema and provision staging, transactions, and DLQ topics.
 target/debug/distributed migrate --backend postgres --json
 
-# Reset the schema and recreate the topics (test/teardown only).
+# Reset the schema only (test/teardown only).
 target/debug/distributed migrate --backend postgres --fresh --json
+
+# Reset the schema and recreate the default topics (destructive; suite setup).
+target/debug/distributed migrate --backend postgres --fresh --fresh-topics --json
 
 # Parse a manifest, mint canonical client IDs, and stage rows.
 target/debug/distributed ingest --manifest manifest.json --job job-1 --json

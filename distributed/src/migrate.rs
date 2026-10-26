@@ -134,6 +134,19 @@ pub async fn run_fresh(
         Backend::MariaDb => reset_mariadb(database_url).await?,
     }
 
+    run(backend, database_url, kafka_bootstrap).await
+}
+
+/// Reset the database and recreate the default Kafka topics.
+///
+/// Topic recreation is deliberately separate from a plain fresh migration: a
+/// database-portability run must not delete topics that another scenario is
+/// using.
+pub async fn run_fresh_with_topics(
+    backend: Backend,
+    database_url: &str,
+    kafka_bootstrap: &str,
+) -> Result<MigrateReport, MigrateError> {
     let names = TopicNames::default();
     let topics = [
         names.staging.as_str(),
@@ -142,8 +155,7 @@ pub async fn run_fresh(
     ];
     delete_topics(kafka_bootstrap, &topics).await?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    run(backend, database_url, kafka_bootstrap).await
+    run_fresh(backend, database_url, kafka_bootstrap).await
 }
 
 async fn delete_topics(

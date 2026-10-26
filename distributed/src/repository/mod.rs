@@ -168,6 +168,21 @@ pub struct TransactionRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobFileInput {
+    pub source_id: String,
+    pub file_ord: u32,
+    pub file_hash: String,
+    pub location: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCompletionRow {
+    pub source_id: String,
+    pub file_ord: u32,
+    pub row_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmittedRow {
     pub event_id: String,
     pub file_ord: u32,
@@ -248,22 +263,17 @@ pub trait LedgerRepository: Send + Sync {
 
     async fn apply_event(&self, event: &LedgerEvent) -> Result<ApplyOutcome, RepoError>;
 
-    async fn create_job_file(
+    async fn create_job_files(
         &self,
         job_id: &str,
-        source_id: &str,
-        file_ord: u32,
-        file_hash: &str,
-        location: &str,
+        files: &[JobFileInput],
     ) -> Result<(), RepoError>;
 
-    async fn mark_file_complete(
+    async fn mark_files_complete(
         &self,
         job_id: &str,
-        source_id: &str,
-        file_ord: u32,
-        row_count: u64,
-    ) -> Result<(), RepoError>;
+        files: &[FileCompletionRow],
+    ) -> Result<u64, RepoError>;
 
     async fn job_file_complete(&self, job_id: &str, file_ord: u32) -> Result<bool, RepoError>;
 

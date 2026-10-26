@@ -11,14 +11,14 @@ use distributed::ingest::{ingest, IngestConfig, IngestError, StagingRecord};
 use distributed::kafka_staging::KafkaStagingSink;
 use distributed::kafka_transactions::KafkaTransactionSink;
 use distributed::manifest;
-use distributed::migrate::{run, run_fresh, Backend, MigrateError};
+use distributed::migrate::{run, run_fresh, run_fresh_with_topics, Backend, MigrateError};
 use distributed::partition::{
     EmittedEvent, PartitionError, PartitionRepository, Partitioner, StagingPosition,
     StalledWatermark,
 };
 use distributed::repository::mariadb::MariaDbRepository;
 use distributed::repository::postgres::PostgresRepository;
-use distributed::repository::{LedgerRepository, RepoError};
+use distributed::repository::{JobFileInput, LedgerRepository, RepoError};
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
 use rdkafka::{Message, Offset, TopicPartitionList};
@@ -42,6 +42,7 @@ Common options:
 
 migrate options:
   --fresh                        Reset the schema first (test/teardown only)
+  --fresh-topics                 Also recreate the default Kafka topics
 
 ingest options:
   --manifest <path>              Manifest JSON (required)
@@ -187,6 +188,7 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
     let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
     let mut json = false;
     let mut fresh = false;
+    let mut fresh_topics = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -217,6 +219,10 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
                 fresh = true;
                 index += 1;
             }
+            "--fresh-topics" => {
+                fresh_topics = true;
+                index += 1;
+            }
             other => {
                 return Err(MigrateError::Config(format!(
                     "unknown migrate option '{other}'"
@@ -232,7 +238,9 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
         MigrateError::Config("KAFKA_BOOTSTRAP or --kafka-bootstrap is required".to_string())
     })?;
 
-    let report = if fresh {
+    let report = if fresh_topics {
+        run_fresh_with_topics(backend, &database_url, &kafka_bootstrap).await?
+    } else if fresh {
         run_fresh(backend, &database_url, &kafka_bootstrap).await?
     } else {
         run(backend, &database_url, &kafka_bootstrap).await?
@@ -317,17 +325,17 @@ async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
         .create_job(&job_id, &manifest.manifest_hash)
         .await?;
 
-    for file in &manifest.files {
-        repository
-            .create_job_file(
-                &job_id,
-                &file.source_id,
-                file.ordinal,
-                &file.sha256,
-                &file.path.to_string_lossy(),
-            )
-            .await?;
-    }
+    let inputs: Vec<JobFileInput> = manifest
+        .files
+        .iter()
+        .map(|file| JobFileInput {
+            source_id: file.source_id.clone(),
+            file_ord: file.ordinal,
+            file_hash: file.sha256.clone(),
+            location: file.path.to_string_lossy().into_owned(),
+        })
+        .collect();
+    repository.create_job_files(&job_id, &inputs).await?;
 
     let sink = Arc::new(
         KafkaStagingSink::connect(&kafka_bootstrap, &staging_topic, Arc::clone(&repository))
@@ -543,6 +551,8 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
         .set("auto.offset.reset", "earliest")
         .set("enable.partition.eof", "false")
         .set("session.timeout.ms", "6000")
+        .set("socket.timeout.ms", "10000")
+        .set("fetch.wait.max.ms", "500")
         .create()
         .map_err(|error| {
             CommandError::Config(format!("create Kafka consumer: {error}"))

@@ -19,6 +19,7 @@ use transaction_processor::{ProcessingError, TransactionType};
 use crate::manifest::{ValidatedFile, ValidatedManifest};
 
 const STAGING_CHANNEL_CAPACITY: usize = 256;
+const COMPLETION_BATCH: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,16 +91,21 @@ pub fn event_id(source_id: &str, file_hash: &str, row_ord: u32) -> String {
     hex::encode(hasher.finalize())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCompletion {
+    pub source_id: String,
+    pub file_ord: u32,
+    pub row_count: u64,
+}
+
 #[async_trait]
 pub trait StagingSink: Send + Sync {
     async fn stage(&self, record: StagingRecord) -> Result<(), IngestError>;
 
-    async fn complete_file(
+    async fn complete_files(
         &self,
         job_id: &str,
-        source_id: &str,
-        file_ord: u32,
-        row_count: u64,
+        files: &[FileCompletion],
     ) -> Result<(), IngestError>;
 }
 
@@ -162,6 +168,12 @@ struct FileSummary {
     rows_rejected: u64,
 }
 
+#[derive(Debug)]
+struct FileOutcome {
+    summary: FileSummary,
+    completion: FileCompletion,
+}
+
 /// Parse every manifest file in parallel and stage each valid row.
 pub async fn ingest<W>(
     manifest: &ValidatedManifest,
@@ -195,11 +207,20 @@ where
         });
     }
 
+    let mut completions = Vec::new();
     while let Some(result) = tasks.join_next().await {
-        let file = result.map_err(|error| IngestError::Join(error.to_string()))??;
+        let outcome = result.map_err(|error| IngestError::Join(error.to_string()))??;
         summary.files_processed += 1;
-        summary.rows_staged += file.rows_staged;
-        summary.rows_rejected += file.rows_rejected;
+        summary.rows_staged += outcome.summary.rows_staged;
+        summary.rows_rejected += outcome.summary.rows_rejected;
+        completions.push(outcome.completion);
+        if completions.len() >= COMPLETION_BATCH {
+            sink.complete_files(job_id, &completions).await?;
+            completions.clear();
+        }
+    }
+    if !completions.is_empty() {
+        sink.complete_files(job_id, &completions).await?;
     }
 
     Ok(summary)
@@ -209,7 +230,7 @@ async fn process_file<W>(
     file: ValidatedFile,
     job_id: String,
     sink: Arc<W>,
-) -> Result<FileSummary, IngestError>
+) -> Result<FileOutcome, IngestError>
 where
     W: StagingSink + 'static,
 {
@@ -234,14 +255,18 @@ where
         .await
         .map_err(|error| IngestError::Join(error.to_string()))??;
 
-    // Every staged record has been acknowledged before the file is marked
-    // complete. The partitioner only orders files whose watermark is complete.
-    sink.complete_file(&job_id, &file.source_id, file.ordinal, rows_staged)
-        .await?;
-
-    Ok(FileSummary {
-        rows_staged,
-        rows_rejected: parse.rows_rejected,
+    // Every staged record has been acknowledged. Completion is reported to the
+    // driver so it can batch the durable watermark writes.
+    Ok(FileOutcome {
+        summary: FileSummary {
+            rows_staged,
+            rows_rejected: parse.rows_rejected,
+        },
+        completion: FileCompletion {
+            source_id: file.source_id,
+            file_ord: file.ordinal,
+            row_count: rows_staged,
+        },
     })
 }
 
@@ -316,19 +341,20 @@ mod tests {
             Ok(())
         }
 
-        async fn complete_file(
+        async fn complete_files(
             &self,
             job_id: &str,
-            source_id: &str,
-            file_ord: u32,
-            row_count: u64,
+            files: &[FileCompletion],
         ) -> Result<(), IngestError> {
-            self.completions.lock().await.push((
-                job_id.to_string(),
-                source_id.to_string(),
-                file_ord,
-                row_count,
-            ));
+            let mut completions = self.completions.lock().await;
+            for file in files {
+                completions.push((
+                    job_id.to_string(),
+                    file.source_id.clone(),
+                    file.file_ord,
+                    file.row_count,
+                ));
+            }
             Ok(())
         }
     }

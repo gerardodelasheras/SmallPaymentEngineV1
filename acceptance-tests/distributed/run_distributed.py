@@ -103,6 +103,7 @@ def main(argv):
             "--backend",
             backend,
             "--fresh",
+            "--fresh-topics",
             "--json",
         ],
         cwd=ROOT,

@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::QueryBuilder;
 use sqlx::Row;
 use tokio::sync::Mutex;
 use transaction_processor::{
@@ -11,8 +12,8 @@ use transaction_processor::{
 
 use super::{
     entry_state_from_str, entry_state_str, retry_transient, AccountRow, ApplyOutcome,
-    EmittedRow, IdBlock, JobFileRow, JobProgress, JobState, LedgerEvent, LedgerRepository,
-    RepoError, RowJournal, TransactionRow,
+    EmittedRow, FileCompletionRow, IdBlock, JobFileInput, JobFileRow, JobProgress, JobState,
+    LedgerEvent, LedgerRepository, RepoError, RowJournal, TransactionRow,
 };
 
 pub struct PostgresRepository {
@@ -88,63 +89,82 @@ impl LedgerRepository for PostgresRepository {
         retry_transient(|| self.apply_event_once(event)).await
     }
 
-    async fn create_job_file(
+    async fn create_job_files(
         &self,
         job_id: &str,
-        source_id: &str,
-        file_ord: u32,
-        file_hash: &str,
-        location: &str,
+        files: &[JobFileInput],
     ) -> Result<(), RepoError> {
-        let file_ord = i32::try_from(file_ord).map_err(|_| {
-            RepoError::InvalidState("file ordinal exceeds i32".to_string())
-        })?;
-        sqlx::query(
-            "INSERT INTO job_files \
-             (job_id, source_id, file_ord, file_hash, location, state) \
-             VALUES ($1, $2, $3, $4, $5, 'pending') \
-             ON CONFLICT (job_id, file_ord) DO NOTHING",
-        )
-        .bind(job_id)
-        .bind(source_id)
-        .bind(file_ord)
-        .bind(file_hash)
-        .bind(location)
-        .execute(&self.pool)
-        .await?;
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let rows: Vec<(i32, &str, &str, &str)> = files
+            .iter()
+            .map(|file| {
+                let file_ord = i32::try_from(file.file_ord).map_err(|_| {
+                    RepoError::InvalidState("file ordinal exceeds i32".to_string())
+                })?;
+                Ok((
+                    file_ord,
+                    file.source_id.as_str(),
+                    file.file_hash.as_str(),
+                    file.location.as_str(),
+                ))
+            })
+            .collect::<Result<_, RepoError>>()?;
+
+        for chunk in rows.chunks(1_000) {
+            let mut builder = QueryBuilder::new(
+                "INSERT INTO job_files \
+                 (job_id, source_id, file_ord, file_hash, location, state) ",
+            );
+            builder.push_values(chunk, |mut row, (file_ord, source_id, file_hash, location)| {
+                row.push_bind(job_id)
+                    .push_bind(*source_id)
+                    .push_bind(*file_ord)
+                    .push_bind(*file_hash)
+                    .push_bind(*location)
+                    .push_bind("pending");
+            });
+            builder.push(" ON CONFLICT (job_id, file_ord) DO NOTHING");
+            builder.build().execute(&self.pool).await?;
+        }
         Ok(())
     }
 
-    async fn mark_file_complete(
+    async fn mark_files_complete(
         &self,
         job_id: &str,
-        source_id: &str,
-        file_ord: u32,
-        row_count: u64,
-    ) -> Result<(), RepoError> {
-        let file_ord = i32::try_from(file_ord).map_err(|_| {
-            RepoError::InvalidState("file ordinal exceeds i32".to_string())
-        })?;
-        let row_count = i64::try_from(row_count).map_err(|_| {
-            RepoError::InvalidState("row count exceeds i64".to_string())
-        })?;
-        let updated = sqlx::query(
-            "UPDATE job_files SET state = 'complete', row_count = $4, \
-             completed_at = now() \
-             WHERE job_id = $1 AND source_id = $2 AND file_ord = $3",
-        )
-        .bind(job_id)
-        .bind(source_id)
-        .bind(file_ord)
-        .bind(row_count)
-        .execute(&self.pool)
-        .await?;
-        if updated.rows_affected() == 0 {
-            return Err(RepoError::Inconsistent(format!(
-                "job file {job_id}/{source_id}/{file_ord} is not registered"
-            )));
+        files: &[FileCompletionRow],
+    ) -> Result<u64, RepoError> {
+        if files.is_empty() {
+            return Ok(0);
         }
-        Ok(())
+
+        let mut db = self.pool.begin().await?;
+        let mut updated = 0_u64;
+        for file in files {
+            let file_ord = i32::try_from(file.file_ord).map_err(|_| {
+                RepoError::InvalidState("file ordinal exceeds i32".to_string())
+            })?;
+            let row_count = i64::try_from(file.row_count).map_err(|_| {
+                RepoError::InvalidState("row count exceeds i64".to_string())
+            })?;
+            let result = sqlx::query(
+                "UPDATE job_files SET state = 'complete', row_count = $4, \
+                 completed_at = now() \
+                 WHERE job_id = $1 AND source_id = $2 AND file_ord = $3",
+            )
+            .bind(job_id)
+            .bind(&file.source_id)
+            .bind(file_ord)
+            .bind(row_count)
+            .execute(&mut *db)
+            .await?;
+            updated += result.rows_affected();
+        }
+        db.commit().await?;
+        Ok(updated)
     }
 
     async fn job_file_complete(&self, job_id: &str, file_ord: u32) -> Result<bool, RepoError> {
