@@ -11,18 +11,24 @@ use distributed::ingest::{ingest, IngestConfig, IngestError, StagingRecord};
 use distributed::kafka_staging::KafkaStagingSink;
 use distributed::kafka_transactions::KafkaTransactionSink;
 use distributed::manifest;
-use distributed::migrate::{run, run_fresh, run_fresh_with_topics, Backend, MigrateError};
+use distributed::migrate::{
+    run_fresh, run_fresh_with_topics, run_with_topics, Backend, MigrateError, TopicNames,
+    TopicPartitions,
+};
 use distributed::partition::{
     EmittedEvent, PartitionError, PartitionRepository, Partitioner, StagingPosition,
     StalledWatermark,
 };
 use distributed::repository::mariadb::MariaDbRepository;
 use distributed::repository::postgres::PostgresRepository;
-use distributed::repository::{JobFileInput, LedgerRepository, RepoError};
+use distributed::repository::{
+    JobFileInput, JobState, LedgerRepository, RepoError,
+};
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
 use rdkafka::{Message, Offset, TopicPartitionList};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 const USAGE: &str = "\
 Usage: distributed <command> [options]
@@ -41,6 +47,7 @@ Common options:
   --json                         Print a JSON report
 
 migrate options:
+  --staging-topic <name>         Staging topic to provision (default: staging)
   --fresh                        Reset the schema first (test/teardown only)
   --fresh-topics                 Also recreate the default Kafka topics
 
@@ -49,6 +56,7 @@ ingest options:
   --job <id>                     Job id (default: derived from manifest hash)
   --staging-topic <name>         Default: staging
   --max-concurrent-files <n>     Default: 8
+  --crash-after-rows <n>         Test hook: simulate a crash after n rows
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -186,6 +194,7 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
     let mut backend = Backend::Postgres;
     let mut database_url = env::var("DATABASE_URL").ok();
     let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
+    let mut staging_topic = "staging".to_string();
     let mut json = false;
     let mut fresh = false;
     let mut fresh_topics = false;
@@ -223,6 +232,10 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
                 fresh_topics = true;
                 index += 1;
             }
+            "--staging-topic" => {
+                staging_topic = take_value(args, &mut index)
+                    .map_err(|error| MigrateError::Config(error.to_string()))?;
+            }
             other => {
                 return Err(MigrateError::Config(format!(
                     "unknown migrate option '{other}'"
@@ -243,7 +256,18 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
     } else if fresh {
         run_fresh(backend, &database_url, &kafka_bootstrap).await?
     } else {
-        run(backend, &database_url, &kafka_bootstrap).await?
+        let names = TopicNames {
+            staging: staging_topic,
+            ..TopicNames::default()
+        };
+        run_with_topics(
+            backend,
+            &database_url,
+            &kafka_bootstrap,
+            &names,
+            TopicPartitions::default(),
+        )
+        .await?
     };
     if json {
         println!(
@@ -259,6 +283,27 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
     Ok(())
 }
 
+fn manifest_file_hash(path: &str) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            hex::encode(hasher.finalize())
+        }
+        Err(_) => "0".repeat(64),
+    }
+}
+
+async fn connect_ledger_repository(
+    backend: Backend,
+    database_url: &str,
+) -> Result<Arc<dyn LedgerRepository>, CommandError> {
+    Ok(match backend {
+        Backend::Postgres => Arc::new(PostgresRepository::connect(database_url).await?),
+        Backend::MariaDb => Arc::new(MariaDbRepository::connect(database_url).await?),
+    })
+}
+
 async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
     let mut manifest_path: Option<String> = None;
     let mut job_id: Option<String> = None;
@@ -267,6 +312,7 @@ async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
     let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
     let mut staging_topic = "staging".to_string();
     let mut max_concurrent_files = 8_usize;
+    let mut crash_after_rows: Option<usize> = None;
     let mut json = false;
 
     let mut index = 0;
@@ -288,6 +334,14 @@ async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
                         "--max-concurrent-files must be a positive integer".to_string(),
                     )
                 })?;
+            }
+            "--crash-after-rows" => {
+                let value = take_value(args, &mut index)?;
+                crash_after_rows = Some(value.parse::<usize>().map_err(|_| {
+                    CommandError::Config(
+                        "--crash-after-rows must be a non-negative integer".to_string(),
+                    )
+                })?);
             }
             "--json" => {
                 json = true;
@@ -311,15 +365,32 @@ async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
         CommandError::Config("KAFKA_BOOTSTRAP or --kafka-bootstrap is required".to_string())
     })?;
 
-    let manifest = manifest::load(Path::new(&manifest_path))?;
+    let manifest = match manifest::load(Path::new(&manifest_path)) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let raw_hash = manifest_file_hash(&manifest_path);
+            let failed_job = job_id.unwrap_or_else(|| {
+                format!("job-{}", &raw_hash[..12])
+            });
+            let repository =
+                connect_ledger_repository(backend, &database_url).await?;
+            repository.create_job(&failed_job, &raw_hash).await?;
+            let state = if manifest_exit_code(&error) == 3 {
+                JobState::Failed
+            } else {
+                JobState::Rejected
+            };
+            repository
+                .finish_job(&failed_job, state, Some(&error.to_string()))
+                .await?;
+            return Err(CommandError::Manifest(error));
+        }
+    };
     let job_id = job_id.unwrap_or_else(|| {
         format!("job-{}", &manifest.manifest_hash[..12])
     });
 
-    let repository: Arc<dyn LedgerRepository> = match backend {
-        Backend::Postgres => Arc::new(PostgresRepository::connect(&database_url).await?),
-        Backend::MariaDb => Arc::new(MariaDbRepository::connect(&database_url).await?),
-    };
+    let repository = connect_ledger_repository(backend, &database_url).await?;
 
     repository
         .create_job(&job_id, &manifest.manifest_hash)
@@ -337,10 +408,13 @@ async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
         .collect();
     repository.create_job_files(&job_id, &inputs).await?;
 
-    let sink = Arc::new(
+    let mut sink =
         KafkaStagingSink::connect(&kafka_bootstrap, &staging_topic, Arc::clone(&repository))
-            .await?,
-    );
+            .await?;
+    if let Some(limit) = crash_after_rows {
+        sink = sink.with_stage_limit(limit);
+    }
+    let sink = Arc::new(sink);
     let summary = ingest(
         &manifest,
         &job_id,
@@ -557,11 +631,54 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
         .map_err(|error| {
             CommandError::Config(format!("create Kafka consumer: {error}"))
         })?;
-    consumer
-        .subscribe(&[staging_topic.as_str()])
-        .map_err(|error| {
-            CommandError::Config(format!("subscribe to staging topic: {error}"))
+    if drain {
+        // Test/teardown mode: assign every staging partition directly so the
+        // finite run does not wait on consumer-group rebalancing.
+        let metadata = consumer
+            .fetch_metadata(Some(&staging_topic), Duration::from_secs(10))
+            .map_err(|error| {
+                CommandError::Config(format!(
+                    "fetch staging metadata: {error}"
+                ))
+            })?;
+        let mut offsets = TopicPartitionList::new();
+        let mut any = false;
+        for topic in metadata.topics() {
+            if topic.name() != staging_topic {
+                continue;
+            }
+            for partition in topic.partitions() {
+                offsets
+                    .add_partition_offset(
+                        &staging_topic,
+                        partition.id(),
+                        Offset::Beginning,
+                    )
+                    .map_err(|error| {
+                        CommandError::Config(format!(
+                            "build assignment: {error}"
+                        ))
+                    })?;
+                any = true;
+            }
+        }
+        if !any {
+            return Err(CommandError::Config(format!(
+                "staging topic '{staging_topic}' has no partitions"
+            )));
+        }
+        consumer.assign(&offsets).map_err(|error| {
+            CommandError::Config(format!("assign staging partitions: {error}"))
         })?;
+    } else {
+        consumer
+            .subscribe(&[staging_topic.as_str()])
+            .map_err(|error| {
+                CommandError::Config(format!(
+                    "subscribe to staging topic: {error}"
+                ))
+            })?;
+    }
 
     let expected = expect.unwrap_or(u64::MAX);
     let mut interval = tokio::time::interval(Duration::from_millis(250));
@@ -583,21 +700,23 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                     last_progress = Instant::now();
                     append_emitted(&mut report, &job_filter, emitted);
                 }
-                commit_ready(
-                    &consumer,
-                    &staging_topic,
-                    &engine,
-                    &last_offsets,
-                    &mut committed,
-                    &barred,
-                )?;
+                if !drain {
+                    commit_ready(
+                        &consumer,
+                        &staging_topic,
+                        &engine,
+                        &last_offsets,
+                        &mut committed,
+                        &barred,
+                    )?;
+                }
 
                 if drain && records_seen >= expected && engine.buffered_rows() == 0 {
                     break;
                 }
                 if drain
                     && engine.buffered_rows() == 0
-                    && last_message.elapsed() >= Duration::from_secs(5)
+                    && last_message.elapsed() >= Duration::from_secs(15)
                 {
                     break;
                 }
@@ -622,14 +741,20 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
 
                         if let Some(job_id) = &job_filter {
                             if &staging.job_id != job_id {
-                                commit_ready(
-                                    &consumer,
-                                    &staging_topic,
-                                    &engine,
-                                    &last_offsets,
-                                    &mut committed,
-                                    &barred,
-                                )?;
+                                if !drain {
+                                    if !drain {
+                                        if !drain {
+                                            commit_ready(
+                                                &consumer,
+                                                &staging_topic,
+                                                &engine,
+                                                &last_offsets,
+                                                &mut committed,
+                                                &barred,
+                                            )?;
+                                        }
+                                    }
+                                }
                                 continue;
                             }
                         }
@@ -644,14 +769,18 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                                         last_progress = Instant::now();
                                         append_emitted(&mut report, &job_filter, emitted);
                                     }
-                                    commit_ready(
-                                        &consumer,
-                                        &staging_topic,
-                                        &engine,
-                                        &last_offsets,
-                                        &mut committed,
-                                        &barred,
-                                    )?;
+                                    if !drain {
+                                        if !drain {
+                                            commit_ready(
+                                                &consumer,
+                                                &staging_topic,
+                                                &engine,
+                                                &last_offsets,
+                                                &mut committed,
+                                                &barred,
+                                            )?;
+                                        }
+                                    }
                                     break;
                                 }
                                 Err(PartitionError::BufferFull(_)) => {
@@ -670,14 +799,16 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                                             last_progress = Instant::now();
                                             append_emitted(&mut report, &job_filter, emitted);
                                         }
-                                        commit_ready(
-                                            &consumer,
-                                            &staging_topic,
-                                            &engine,
-                                            &last_offsets,
-                                            &mut committed,
-                                            &barred,
-                                        )?;
+                                        if !drain {
+                                            commit_ready(
+                                                &consumer,
+                                                &staging_topic,
+                                                &engine,
+                                                &last_offsets,
+                                                &mut committed,
+                                                &barred,
+                                            )?;
+                                        }
                                         if engine.buffered_rows() < max_buffered_rows {
                                             break;
                                         }

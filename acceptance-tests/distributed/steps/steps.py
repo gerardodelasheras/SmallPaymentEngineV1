@@ -235,7 +235,23 @@ def step_buffer_overflow(context):
 
 @both("ingestion crashes after staging half of a file")
 def step_crash_half_file(context):
-    harness(context).crash_half = True
+    h = harness(context)
+    h.subject = 7
+    h.add_file(
+        1,
+        rows=[
+            "deposit,7,1,1.0",
+            "deposit,7,2,1.0",
+            "deposit,7,3,1.0",
+            "deposit,7,4,1.0",
+        ],
+    )
+    h.crash_after_rows = 2
+    h.job_id = h._new_job_id()
+    h.run_job(job_name=h.job_id, stages=["migrate", "ingest"])
+    h.staged = 2
+    h.file_incomplete = h.file_state(h.job_id, 1) != "complete"
+    h.crash_after_rows = None
 
 
 @both("a completed file is submitted again under a later job")
@@ -318,7 +334,9 @@ def step_more_rows(context):
 
 @both("it restarts")
 def step_restarts(context):
-    harness(context).run_job()
+    h = harness(context)
+    h.stall_timeout = 1
+    h.run_job(job_name=h.job_id, stages=["partition"])
 
 
 @both("the job is accepted")
@@ -335,7 +353,12 @@ def step_both_files_staged(context):
 
 @both("the job is rejected")
 def step_job_rejected(context):
-    rejected(context)
+    result = rejected(context)
+    h = harness(context)
+    if h.job_id:
+        state = h.stored_job_state(h.job_id)
+        assert state == "rejected", (state, h.job_id)
+    return result
 
 
 @both("no events are emitted")
@@ -347,7 +370,12 @@ def step_no_events(context):
 
 @both("the job is marked failed")
 def step_job_failed(context):
-    failed(context)
+    result = failed(context)
+    h = harness(context)
+    if h.job_id:
+        state = h.stored_job_state(h.job_id)
+        assert state == "failed", (state, h.job_id)
+    return result
 
 
 @both("no partial accounts CSV is exported")
@@ -382,7 +410,7 @@ def step_malformed_reported(context):
 def step_file_order(context):
     h = harness(context)
     accepted(context)
-    assert h.order == [(1, 0), (17, 0)], h.order
+    assert h.order == [(1, 0), (17, 0)], (h.order, h.partition_report)
 
 
 @both("the final account state reflects that order")
@@ -407,22 +435,26 @@ def step_no_interleave(context):
 @both("ingestion pauses rather than growing the buffer without bound")
 def step_backpressure(context):
     h = harness(context)
-    assert h.backpressure, "the partitioner did not apply backpressure"
-    assert h.stalled_watermarks, "no stalled watermark was reported"
+    assert h.backpressure, (
+        "the partitioner did not apply backpressure: "
+        f"{h.partition_report}"
+    )
+    assert h.stalled_watermarks, (
+        f"no stalled watermark was reported: {h.partition_report}"
+    )
 
 
 @both("the file is not complete")
 def step_file_incomplete(context):
     h = harness(context)
-    accepted(context)
-    assert not h.file_complete
+    assert h.file_incomplete, h.partition_report
 
 
 @both("the partitioner does not emit that file's rows until they are fully staged")
 def step_no_emit_incomplete(context):
     h = harness(context)
-    accepted(context)
-    assert h.emitted == 0
+    assert h.order == [], (h.order, h.partition_report)
+    assert h.stalled_watermarks, h.partition_report
 
 
 @both("no ledger effect is applied twice")
@@ -906,7 +938,7 @@ def step_later_job_starts(context):
     fresh_job(h)
     h.subject = 42
     h.deposit(h.subject, "10.0")
-    h.run_ledger_job()
+    h.run_job(stages=["migrate", "ingest"])
     accepted(context)
 
 

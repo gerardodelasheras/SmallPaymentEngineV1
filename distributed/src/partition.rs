@@ -771,6 +771,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn re_ingesting_the_same_file_keeps_the_content_event_id() {
+        let repository = Arc::new(TestRepository::default());
+        repository.set_files("job-a", vec![file(1, "complete", 1, 0)]);
+        repository.set_files("job-b", vec![file(1, "complete", 1, 0)]);
+        let sink = Arc::new(TestSink::default());
+        let mut partitioner = partitioner(Arc::clone(&repository), Arc::clone(&sink), 100).await;
+
+        let (mut first, first_position) = staging("job-a", 7, 1, 0, 10);
+        first.event_id = "content-event".to_string();
+        let (mut second, second_position) = staging("job-b", 7, 1, 0, 11);
+        second.event_id = first.event_id.clone();
+
+        partitioner
+            .push(&first, first_position)
+            .await
+            .expect("first job");
+        partitioner
+            .push(&second, second_position)
+            .await
+            .expect("second job");
+
+        let records = sink.records.lock().await;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].event_id, records[1].event_id);
+        assert_ne!(records[0].job_id, records[1].job_id);
+        // Progress is job-scoped; the worker dedupes the ledger event itself.
+        assert_eq!(repository.emitted_count(), 2);
+    }
+
+    #[tokio::test]
     async fn buffer_limit_is_enforced() {
         let repository = Arc::new(TestRepository::default());
         repository.set_files("job", vec![file(1, "pending", 2, 0)]);

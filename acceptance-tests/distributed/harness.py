@@ -113,6 +113,8 @@ class DistributedHarness:
         self.max_buffered_rows = None
         self.stall_timeout = None
         self.force_pending_file_ord = None
+        self.crash_after_rows = None
+        self.file_incomplete = False
         self.file_complete = True
         self.emitted = 0
         self.export_path = self.workdir / "accounts.csv"
@@ -156,6 +158,22 @@ class DistributedHarness:
         self.password = "s3cr3t-distributed"
         self.conflict_attempts = 0
         self.journal_counts = []
+
+    def stored_job_state(self, job_id=None):
+        job_id = job_id or self.job_id
+        if not job_id:
+            return None
+        row = self.sql(
+            f"SELECT state FROM jobs WHERE job_id = '{job_id}'"
+        )
+        return row.strip() if row else None
+
+    def file_state(self, job_id, file_ord):
+        row = self.sql(
+            "SELECT state FROM job_files "
+            f"WHERE job_id = '{job_id}' AND file_ord = {int(file_ord)}"
+        )
+        return row.strip() if row else None
 
     def cleanup(self):
         shutil.rmtree(self.workdir, ignore_errors=True)
@@ -356,6 +374,10 @@ class DistributedHarness:
         self.job_seq += 1
         return job_id
 
+    @staticmethod
+    def staging_topic(job_name):
+        return f"staging-{job_name}"
+
     def _record(self, status, completed, stdout, stderr, job_id):
         self.last_stdout = "\n".join(stdout)
         self.last_stderr = "\n".join(stderr)
@@ -391,7 +413,14 @@ class DistributedHarness:
         job_name = job_name or self.job_id or self._new_job_id()
         self.job_id = job_name
         if stage == "migrate":
-            command = ["migrate", "--backend", backend or self.backend, "--json"]
+            command = [
+                "migrate",
+                "--backend",
+                backend or self.backend,
+                "--staging-topic",
+                self.staging_topic(job_name),
+                "--json",
+            ]
         elif stage == "ingest":
             path = manifest_path or self._manifest_path(job_name)
             command = [
@@ -400,13 +429,19 @@ class DistributedHarness:
                 str(path),
                 "--job",
                 job_name,
+                "--staging-topic",
+                self.staging_topic(job_name),
                 "--json",
             ]
+            if self.crash_after_rows is not None:
+                command += ["--crash-after-rows", str(self.crash_after_rows)]
         elif stage == "partition":
             command = [
                 "partition",
                 "--job",
                 job_name,
+                "--staging-topic",
+                self.staging_topic(job_name),
                 "--drain",
                 "--expect",
                 str(self.staged),

@@ -79,7 +79,9 @@ target/debug/distributed migrate --backend postgres --fresh --fresh-topics --jso
 target/debug/distributed ingest --manifest manifest.json --job job-1 --json
 
 # Consume staging, order per client, and emit to transactions.
-# --drain/--expect is a finite test mode; omit them for a long-running service.
+# --drain/--expect is a finite test mode; it assigns partitions directly so
+# it does not wait on consumer-group rebalancing. Omit them for the
+# long-running service, which uses a consumer group and commits offsets.
 target/debug/distributed partition --job job-1 --drain --expect 100 --json
 ```
 
@@ -109,4 +111,6 @@ cargo test -p distributed --test mariadb_repository
 cargo test -p distributed --test migrate
 ```
 
-The distributed Behave suite lives in `acceptance-tests/distributed/`.
+The distributed Behave suite lives in `acceptance-tests/distributed/`. It uses
+`--drain` for deterministic finite runs and `--crash-after-rows` to simulate a
+partial ingest for the restart/resume scenario.

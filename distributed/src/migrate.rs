@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::config::ClientConfig;
 use rdkafka::error::RDKafkaErrorCode;
 use serde::Serialize;
@@ -376,6 +377,46 @@ async fn provision_topics(
                     "create topic '{name}': {code:?}"
                 )));
             }
+        }
+    }
+    // Topic creation is asynchronous. Wait until every topic has a leader before
+    // an immediate producer or consumer connects.
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", kafka_bootstrap)
+        .set("client.id", KAFKA_CLIENT_ID)
+        .create()
+        .map_err(|error| {
+            MigrateError::Kafka(format!("create metadata client: {error}"))
+        })?;
+    for (name, _) in topics {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ready = consumer
+                .fetch_metadata(Some(name), std::time::Duration::from_secs(2))
+                .ok()
+                .and_then(|metadata| {
+                    metadata
+                        .topics()
+                        .iter()
+                        .find(|topic| topic.name() == *name)
+                        .map(|topic| {
+                            !topic.partitions().is_empty()
+                                && topic
+                                    .partitions()
+                                    .iter()
+                                    .all(|partition| partition.leader() >= 0)
+                        })
+                })
+                .unwrap_or(false);
+            if ready {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(MigrateError::Kafka(format!(
+                    "topic '{name}' did not become ready"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
     Ok(created)

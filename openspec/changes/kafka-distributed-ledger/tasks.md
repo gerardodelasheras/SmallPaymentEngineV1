@@ -40,7 +40,7 @@
 - [x] 4.4 Produce staging records keyed by source-scoped external key with an idempotent producer; flush before marking a file complete.
 - [x] 4.5 Implement the partitioner: consume staging, map external keys to canonical IDs, own each source-scoped client through exactly one staging partition (many clients share a partition; a replica may own several partitions), buffer until earlier files complete, emit in `(file_ord, row_ord)` order keyed by canonical ID, and update emitted progress.
 - [x] 4.6 Bound partitioner buffers and apply Kafka backpressure; expose a stalled-watermark signal.
-- [ ] 4.7 Add restart/resume tests for partial files, re-ingestion idempotency, overlapping-file ordering, and manifest failure -> terminal job failure.
+- [x] 4.7 Add restart/resume tests for partial files, re-ingestion idempotency, overlapping-file ordering, and manifest failure -> terminal job failure.
 - [ ] 4.8 Add topic provisioning/partition-count configuration for staging, transactions, and DLQ; document that changing the transactions partition count rekeys clients.
 
 ## 5. Distributed ledger worker

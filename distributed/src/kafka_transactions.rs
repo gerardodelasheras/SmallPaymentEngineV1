@@ -25,7 +25,7 @@ impl KafkaTransactionSink {
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap)
             .set("client.id", CLIENT_ID)
-            .set("message.timeout.ms", "10000")
+            .set("message.timeout.ms", "30000")
             .set("enable.idempotence", "true")
             .set("acks", "all")
             .set("partitioner", "murmur2_random")
