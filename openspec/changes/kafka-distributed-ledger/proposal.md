@@ -38,7 +38,7 @@ None. The in-memory CLI and the existing ledger, ingestion, reporting, arithmeti
 
 - **Packaging:** a new crate/workspace member; the existing package, its single binary, bare `cargo run`, and public submission stay unchanged.
 - **Code:** shared-core extraction, a durable repository, a partitioner with bounded buffers, new service binaries for ingest/partition/worker/export/migrate, and the existing binary unchanged. The library API changes; the CLI behavior does not.
-- **Dependencies:** a Kafka client (for example `rdkafka`, which requires a C toolchain/librdkafka, or a pure-Rust alternative), a SQL client with migrations (`sqlx`), and container-based test support. Fixed-point `i64` and the no-floating-point rule carry over.
+- **Dependencies:** `rdkafka` with the native librdkafka library (the implemented choice, because consumer groups, rebalancing, offset commits, idempotent production, and admin operations are required), a SQL client with migrations (`sqlx`), and container-based test support. Fixed-point `i64` and the no-floating-point rule carry over.
 - **Systems:** Kafka, PostgreSQL or MariaDB/Galera, a migration runner, topics with a chosen partition count, DLQ wiring, credentials, and monitoring.
 - **Data:** clients and external keys, accounts, the global transaction index with terminal journal, content-addressed idempotency records, job/file watermarks, and progress. Journal and idempotency retention is unbounded in v1.
 - **Tests:** a distributed acceptance harness, both database backends, Kafka rebalance/redelivery cases, and a cross-variant oracle that runs the same CSV through the CLI and the distributed variant and compares balances.

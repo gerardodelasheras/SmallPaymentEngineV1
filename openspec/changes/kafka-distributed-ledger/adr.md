@@ -1,11 +1,11 @@
 # ADR Review Manifest
 
 - Status: completed
-- Review date: 2026-10-24
+- Review date: 2026-10-25
 
 ## Review Summary
 
-ADR review completed for `kafka-distributed-ledger`. The change introduces a separate distributed crate and eight durable decisions covering packaging, shared-core extraction, canonical identity, ordered ingestion, stateless DB-backed workers, the global terminal journal, database portability, and job-scoped export. The four in-force ADRs were reviewed and remain unaffected; none is superseded.
+ADR review completed for `kafka-distributed-ledger`. The change introduces a separate distributed crate and nine durable decisions covering packaging, shared-core extraction, canonical identity, ordered ingestion, stateless DB-backed workers, the global terminal journal, database portability, job-scoped export, and the Kafka client choice. The four in-force ADRs were reviewed and remain unaffected; none is superseded.
 
 ## In-Force ADRs Reviewed
 
@@ -24,3 +24,4 @@ ADR review completed for `kafka-distributed-ledger`. The change introduces a sep
 - `adr/0010-global-transaction-journal.md` — global `tx_id` index and full terminal `charged_back` journal in one logical database.
 - `adr/0011-postgres-mariadb-galera-portability.md` — one repository contract, portable allocator, conflict retries, and Galera as HA rather than sharding.
 - `adr/0012-job-scoped-export-serialization.md` — one active batch job, completion watermark, canonical-ID export, and terminal failure semantics.
+- `adr/0013-rdkafka-client.md` — rdkafka replaces rskafka because consumer groups, rebalancing, offset commits, idempotent production, and admin operations are required; the native librdkafka dependency and version pin are recorded.

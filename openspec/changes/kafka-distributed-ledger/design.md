@@ -240,6 +240,19 @@ Alternatives considered:
 - A single control topic consumed by every partitioner: requires per-instance consumer groups or broadcast and is harder to make durable.
 - Few partitions: caps consumer parallelism; the chosen count is an operational input.
 
+### D11: Kafka client
+
+`rdkafka` 0.37, dynamically linked against system librdkafka, is the producer, consumer, and admin client. `rskafka` was the initial pure-Rust choice, but it explicitly has no consumer-group membership, rebalancing, offset tracking, or transactions. Those are core requirements for the partitioner and worker (ADR-0009, ADR-0013), so the native dependency is accepted.
+
+The crate is pinned to `rdkafka` 0.37 with `rdkafka-sys` 4.8.0+2.3.0 because Debian trixie provides librdkafka 2.8. `rdkafka` 0.39 requires librdkafka 2.12 or newer. Producers use idempotent delivery; consumers disable auto-commit and commit offsets only after the durable work. The `migrate` command uses the admin client for idempotent topic creation and for the destructive topic recreation in `--fresh`.
+
+Alternatives considered:
+
+- `rskafka` with manual partition assignment and DB-stored offsets: no rebalancing, manual scaling, and a design change to ADR-0009.
+- Implementing the consumer-group protocol directly: high risk and outside the ledger problem.
+- Hybrid `rskafka` admin plus `rdkafka` consumer: two clients and two failure modes.
+- Another pure-Rust client: available crates provide manual assignments and group-offset storage, not dynamic membership.
+
 ## Risks / Trade-offs
 
 | Risk | Mitigation |
