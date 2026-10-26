@@ -217,7 +217,20 @@ def step_two_partitioners(context):
 
 @both("a client with more buffered rows than the configured limit")
 def step_buffer_overflow(context):
-    harness(context).buffer_overflow = True
+    h = harness(context)
+    h.subject = 7
+    h.add_file(1, rows=["deposit,7,1,10.0"])
+    h.add_file(
+        2,
+        rows=[
+            "withdrawal,7,2,1.0",
+            "withdrawal,7,3,1.0",
+            "withdrawal,7,4,1.0",
+        ],
+    )
+    h.force_pending_file_ord = 1
+    h.max_buffered_rows = 1
+    h.stall_timeout = 1
 
 
 @both("ingestion crashes after staging half of a file")
@@ -394,8 +407,8 @@ def step_no_interleave(context):
 @both("ingestion pauses rather than growing the buffer without bound")
 def step_backpressure(context):
     h = harness(context)
-    accepted(context)
-    assert h.backpressure
+    assert h.backpressure, "the partitioner did not apply backpressure"
+    assert h.stalled_watermarks, "no stalled watermark was reported"
 
 
 @both("the file is not complete")

@@ -73,6 +73,17 @@ pub struct EmittedEvent {
     pub staging: StagingPosition,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StalledWatermark {
+    pub job_id: String,
+    pub source_id: String,
+    pub file_ord: u32,
+    pub blocking_file_ord: u32,
+    pub row_count: u64,
+    pub emitted_rows: u64,
+    pub buffered_rows: usize,
+}
+
 #[async_trait]
 pub trait TransactionSink: Send + Sync {
     async fn emit(&self, record: TransactionRecord) -> Result<i32, PartitionError>;
@@ -187,6 +198,34 @@ struct JobWatermark {
 }
 
 impl JobWatermark {
+    fn blocking(&self, source_id: &str, file_ord: u32) -> Option<(u32, u64, u64)> {
+        let target = self
+            .files
+            .iter()
+            .find(|file| file.source_id == source_id && file.file_ord == file_ord)?;
+
+        if target.state == "failed" {
+            return None;
+        }
+        if target.state != "complete" {
+            return Some((target.file_ord, target.row_count, target.emitted_rows));
+        }
+
+        for earlier in self
+            .files
+            .iter()
+            .filter(|file| file.source_id == source_id && file.file_ord < file_ord)
+        {
+            if earlier.state == "failed" {
+                return None;
+            }
+            if earlier.emitted_rows < earlier.row_count {
+                return Some((earlier.file_ord, earlier.row_count, earlier.emitted_rows));
+            }
+        }
+        None
+    }
+
     fn readiness(&self, source_id: &str, file_ord: u32) -> Readiness {
         let Some(target) = self
             .files
@@ -249,6 +288,45 @@ impl<S: TransactionSink> Partitioner<S> {
 
     pub fn buffered_rows(&self) -> usize {
         self.buffered_rows
+    }
+
+    pub fn stalled_watermarks(&self) -> Vec<StalledWatermark> {
+        let mut result = Vec::new();
+
+        for ((job_id, _client), buffer) in &self.buffers {
+            let Some(watermark) = self.watermarks.get(job_id) else {
+                continue;
+            };
+            let mut seen_files = HashSet::new();
+            for row in buffer.rows.values() {
+                if !seen_files.insert(row.record.file_ord) {
+                    continue;
+                }
+                let Some((blocking_file_ord, row_count, emitted_rows)) =
+                    watermark.blocking(&row.record.source_id, row.record.file_ord)
+                else {
+                    continue;
+                };
+                result.push(StalledWatermark {
+                    job_id: job_id.clone(),
+                    source_id: row.record.source_id.clone(),
+                    file_ord: row.record.file_ord,
+                    blocking_file_ord,
+                    row_count,
+                    emitted_rows,
+                    buffered_rows: buffer.rows.len(),
+                });
+            }
+        }
+
+        result.sort_by(|left, right| {
+            left.job_id
+                .cmp(&right.job_id)
+                .then(left.source_id.cmp(&right.source_id))
+                .then(left.file_ord.cmp(&right.file_ord))
+        });
+        result.dedup();
+        result
     }
 
     pub fn has_buffered_for(&self, staging_partition: i32) -> bool {
@@ -674,6 +752,22 @@ mod tests {
 
         let records = sink.records.lock().await;
         assert_ne!(records[0].client_id, records[1].client_id);
+    }
+
+    #[tokio::test]
+    async fn stalled_watermark_names_the_blocking_file() {
+        let repository = Arc::new(TestRepository::default());
+        repository.set_files("job", vec![file(1, "pending", 1, 0), file(2, "complete", 1, 0)]);
+        let sink = Arc::new(TestSink::default());
+        let mut partitioner = partitioner(repository, sink, 100).await;
+
+        let (later, position) = staging("job", 7, 2, 0, 10);
+        partitioner.push(&later, position).await.expect("push");
+
+        let stalls = partitioner.stalled_watermarks();
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(stalls[0].file_ord, 2);
+        assert_eq!(stalls[0].blocking_file_ord, 1);
     }
 
     #[tokio::test]

@@ -109,6 +109,10 @@ class DistributedHarness:
         self.order = []
         self.owner_duplicates = 0
         self.backpressure = False
+        self.stalled_watermarks = []
+        self.max_buffered_rows = None
+        self.stall_timeout = None
+        self.force_pending_file_ord = None
         self.file_complete = True
         self.emitted = 0
         self.export_path = self.workdir / "accounts.csv"
@@ -408,6 +412,10 @@ class DistributedHarness:
                 str(self.staged),
                 "--json",
             ]
+            if self.max_buffered_rows is not None:
+                command += ["--max-buffered-rows", str(self.max_buffered_rows)]
+            if self.stall_timeout is not None:
+                command += ["--stall-timeout", str(self.stall_timeout)]
         elif stage == "worker":
             command = ["worker", "--drain", "--job", job_name]
         elif stage == "export":
@@ -440,6 +448,12 @@ class DistributedHarness:
             self.staged = int(report.get("rows_staged", 0))
             self.malformed_reported = int(report.get("rows_rejected", 0)) > 0
             self.manifest_hash = report.get("manifest_hash")
+            if self.force_pending_file_ord is not None:
+                self._exec_sql(
+                    "UPDATE job_files SET state = 'pending' "
+                    f"WHERE job_id = '{job_name}' "
+                    f"AND file_ord = {self.force_pending_file_ord}"
+                )
         if stage == "partition" and completed.returncode == EXIT_OK:
             report = json.loads(completed.stdout)
             self.partition_report = report
@@ -447,6 +461,8 @@ class DistributedHarness:
                 (int(entry["file_ord"]), int(entry["row_ord"]))
                 for entry in report.get("emitted", [])
             ]
+            self.backpressure = bool(report.get("backpressure_applied"))
+            self.stalled_watermarks = report.get("stalled_watermarks", [])
         if stage == "migrate" and completed.returncode == EXIT_OK:
             self.seed_identities(backend=backend)
         status = self._classify(stage, completed)

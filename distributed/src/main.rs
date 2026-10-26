@@ -1,6 +1,6 @@
 //! Entry points for the distributed ledger variant.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;
@@ -14,6 +14,7 @@ use distributed::manifest;
 use distributed::migrate::{run, run_fresh, Backend, MigrateError};
 use distributed::partition::{
     EmittedEvent, PartitionError, PartitionRepository, Partitioner, StagingPosition,
+    StalledWatermark,
 };
 use distributed::repository::mariadb::MariaDbRepository;
 use distributed::repository::postgres::PostgresRepository;
@@ -92,6 +93,9 @@ struct PartitionReport {
     job_id: Option<String>,
     records_seen: u64,
     buffered: usize,
+    backpressure_applied: bool,
+    stalled: bool,
+    stalled_watermarks: Vec<StalledWatermark>,
     emitted: Vec<PartitionEmitted>,
 }
 
@@ -382,18 +386,34 @@ fn append_emitted(
     }
 }
 
+fn pause_list(
+    topic: &str,
+    last_offsets: &HashMap<i32, i64>,
+) -> Result<TopicPartitionList, CommandError> {
+    let mut offsets = TopicPartitionList::new();
+    for partition in last_offsets.keys() {
+        offsets
+            .add_partition_offset(topic, *partition, Offset::Offset(0))
+            .map_err(|error| {
+                CommandError::Config(format!("build pause list: {error}"))
+            })?;
+    }
+    Ok(offsets)
+}
+
 fn commit_ready(
     consumer: &StreamConsumer,
     topic: &str,
     engine: &Partitioner<KafkaTransactionSink>,
     last_offsets: &HashMap<i32, i64>,
     committed: &mut HashMap<i32, i64>,
+    barred: &HashSet<i32>,
 ) -> Result<(), CommandError> {
     let mut offsets = TopicPartitionList::new();
     let mut any = false;
 
     for (partition, offset) in last_offsets {
-        if engine.has_buffered_for(*partition) {
+        if barred.contains(partition) || engine.has_buffered_for(*partition) {
             continue;
         }
         let next = offset + 1;
@@ -415,7 +435,7 @@ fn commit_ready(
                 CommandError::Config(format!("commit staging offsets: {error}"))
             })?;
         for (partition, offset) in last_offsets {
-            if !engine.has_buffered_for(*partition) {
+            if !barred.contains(partition) && !engine.has_buffered_for(*partition) {
                 committed.insert(*partition, offset + 1);
             }
         }
@@ -433,6 +453,7 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
     let mut job_filter: Option<String> = None;
     let mut max_buffered_rows = 100_000_usize;
     let mut expect: Option<u64> = None;
+    let mut stall_timeout = Duration::from_secs(5);
     let mut drain = false;
     let mut json = false;
 
@@ -463,6 +484,15 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                     CommandError::Config("--expect must be a non-negative integer".to_string())
                 })?);
             }
+            "--stall-timeout" => {
+                let value = take_value(args, &mut index)?;
+                let seconds = value.parse::<u64>().map_err(|_| {
+                    CommandError::Config(
+                        "--stall-timeout must be a non-negative integer".to_string(),
+                    )
+                })?;
+                stall_timeout = Duration::from_secs(seconds);
+            }
             "--drain" => {
                 drain = true;
                 index += 1;
@@ -477,6 +507,12 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                 )));
             }
         }
+    }
+
+    if max_buffered_rows == 0 {
+        return Err(CommandError::Config(
+            "--max-buffered-rows must be at least 1".to_string(),
+        ));
     }
 
     let database_url = database_url.ok_or_else(|| {
@@ -521,21 +557,29 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     let mut last_offsets: HashMap<i32, i64> = HashMap::new();
     let mut committed: HashMap<i32, i64> = HashMap::new();
+    let mut barred: HashSet<i32> = HashSet::new();
     let mut records_seen = 0_u64;
     let mut report = Vec::new();
     let mut last_message = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut backpressure_applied = false;
+    let mut stalled = false;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 let emitted = engine.tick().await?;
-                append_emitted(&mut report, &job_filter, emitted);
+                if !emitted.is_empty() {
+                    last_progress = Instant::now();
+                    append_emitted(&mut report, &job_filter, emitted);
+                }
                 commit_ready(
                     &consumer,
                     &staging_topic,
                     &engine,
                     &last_offsets,
                     &mut committed,
+                    &barred,
                 )?;
 
                 if drain && records_seen >= expected && engine.buffered_rows() == 0 {
@@ -545,6 +589,13 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                     && engine.buffered_rows() == 0
                     && last_message.elapsed() >= Duration::from_secs(5)
                 {
+                    break;
+                }
+                if drain
+                    && engine.buffered_rows() > 0
+                    && last_progress.elapsed() >= stall_timeout
+                {
+                    stalled = true;
                     break;
                 }
             }
@@ -567,6 +618,7 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                                     &engine,
                                     &last_offsets,
                                     &mut committed,
+                                    &barred,
                                 )?;
                                 continue;
                             }
@@ -574,35 +626,80 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
 
                         records_seen += 1;
                         let position = StagingPosition { partition, offset };
+                        let mut give_up = false;
                         loop {
                             match engine.push(&staging, position).await {
                                 Ok(emitted) => {
-                                    append_emitted(&mut report, &job_filter, emitted);
+                                    if !emitted.is_empty() {
+                                        last_progress = Instant::now();
+                                        append_emitted(&mut report, &job_filter, emitted);
+                                    }
                                     commit_ready(
                                         &consumer,
                                         &staging_topic,
                                         &engine,
                                         &last_offsets,
                                         &mut committed,
+                                        &barred,
                                     )?;
                                     break;
                                 }
                                 Err(PartitionError::BufferFull(_)) => {
-                                    let emitted = engine.tick().await?;
-                                    append_emitted(&mut report, &job_filter, emitted);
-                                    commit_ready(
-                                        &consumer,
-                                        &staging_topic,
-                                        &engine,
-                                        &last_offsets,
-                                        &mut committed,
-                                    )?;
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    backpressure_applied = true;
+                                    let paused = pause_list(&staging_topic, &last_offsets)?;
+                                    consumer.pause(&paused).map_err(|error| {
+                                        CommandError::Config(format!(
+                                            "pause staging consumer: {error}"
+                                        ))
+                                    })?;
+
+                                    let mut stalled_here = false;
+                                    while engine.buffered_rows() >= max_buffered_rows {
+                                        let emitted = engine.tick().await?;
+                                        if !emitted.is_empty() {
+                                            last_progress = Instant::now();
+                                            append_emitted(&mut report, &job_filter, emitted);
+                                        }
+                                        commit_ready(
+                                            &consumer,
+                                            &staging_topic,
+                                            &engine,
+                                            &last_offsets,
+                                            &mut committed,
+                                            &barred,
+                                        )?;
+                                        if engine.buffered_rows() < max_buffered_rows {
+                                            break;
+                                        }
+                                        if drain
+                                            && last_progress.elapsed() >= stall_timeout
+                                        {
+                                            stalled_here = true;
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                    }
+
+                                    consumer.resume(&paused).map_err(|error| {
+                                        CommandError::Config(format!(
+                                            "resume staging consumer: {error}"
+                                        ))
+                                    })?;
+
+                                    if stalled_here {
+                                        stalled = true;
+                                        barred.insert(partition);
+                                        give_up = true;
+                                        break;
+                                    }
                                 }
                                 Err(error) => return Err(CommandError::Partition(error)),
                             }
                         }
 
+                        if give_up {
+                            break;
+                        }
                         if drain && records_seen >= expected && engine.buffered_rows() == 0 {
                             break;
                         }
@@ -622,6 +719,9 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
         job_id: job_filter,
         records_seen,
         buffered: engine.buffered_rows(),
+        backpressure_applied,
+        stalled,
+        stalled_watermarks: engine.stalled_watermarks(),
         emitted: report,
     };
 
@@ -629,10 +729,12 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
         println!("{}", serde_json::to_string(&report)?);
     } else {
         println!(
-            "job={:?} records_seen={} buffered={} emitted={}",
+            "job={:?} records_seen={} buffered={} backpressure={} stalled={} emitted={}",
             report.job_id,
             report.records_seen,
             report.buffered,
+            report.backpressure_applied,
+            report.stalled,
             report.emitted.len()
         );
     }
