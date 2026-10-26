@@ -232,7 +232,7 @@ Alternatives considered:
 - `transactions` topic: keyed by canonical `client_id`; partition count is chosen high before ingestion because increasing it rekeys clients.
 - `DLQ` topic: carries exhausted events with metadata.
 - DB watermarks, not a single control topic, are the ordering source; file completion is durable and queryable.
-- Workers use a consumer group; partition ownership gives one worker per transaction partition. The partitioner uses staging partition ownership for one owner per external client.
+- Workers use a consumer group; partition ownership gives one worker per transaction partition. The partitioner uses staging partition ownership so each source-scoped client is owned by exactly one partitioner replica at a time. Many clients share a staging partition, and one replica may own several partitions; the partition count is a fixed parallelism knob, not a per-client count.
 
 Alternatives considered:
 
