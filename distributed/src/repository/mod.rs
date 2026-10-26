@@ -167,6 +167,21 @@ pub struct TransactionRow {
     pub state: EntryState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmittedRow {
+    pub event_id: String,
+    pub file_ord: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobFileRow {
+    pub file_ord: u32,
+    pub source_id: String,
+    pub state: String,
+    pub row_count: u64,
+    pub emitted_rows: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobProgress {
     pub partition: i32,
@@ -256,8 +271,10 @@ pub trait LedgerRepository: Send + Sync {
         &self,
         job_id: &str,
         partition: i32,
-        count: i64,
-    ) -> Result<(), RepoError>;
+        rows: &[EmittedRow],
+    ) -> Result<u64, RepoError>;
+
+    async fn job_files(&self, job_id: &str) -> Result<Vec<JobFileRow>, RepoError>;
 
     async fn job_progress(&self, job_id: &str) -> Result<Vec<JobProgress>, RepoError>;
 

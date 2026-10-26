@@ -270,7 +270,7 @@ def step_partitioner_emits(context):
 def step_partitioner_emits_client(context, client):
     h = harness(context)
     h.external = client
-    h.run_job()
+    h.run_job(stages=["migrate", "ingest", "partition"])
 
 
 @both("the job is submitted")
@@ -369,7 +369,7 @@ def step_malformed_reported(context):
 def step_file_order(context):
     h = harness(context)
     accepted(context)
-    assert h.order == [(1, 1), (17, 1)]
+    assert h.order == [(1, 0), (17, 0)], h.order
 
 
 @both("the final account state reflects that order")

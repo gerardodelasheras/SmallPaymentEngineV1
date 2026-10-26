@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 use distributed::repository::mariadb::MariaDbRepository;
-use distributed::repository::{JobState, LedgerEvent, LedgerRepository};
+use distributed::repository::{EmittedRow, JobState, LedgerEvent, LedgerRepository};
 use transaction_processor::{
     Amount, CanonicalClientId, EntryState, LedgerTransaction, ProcessingError, TransactionType,
 };
@@ -168,8 +168,14 @@ async fn mariadb_repository_applies_events_atomically() {
         .create_job(job, &hash("manifest"))
         .await
         .expect("create job");
+    let emitted_rows: Vec<EmittedRow> = (0..20)
+        .map(|index| EmittedRow {
+            event_id: format!("{index:064}"),
+            file_ord: 0,
+        })
+        .collect();
     repository
-        .record_emitted(job, 0, 20)
+        .record_emitted(job, 0, &emitted_rows)
         .await
         .expect("record emitted");
 

@@ -83,6 +83,20 @@ CREATE TABLE IF NOT EXISTS job_events (
     PRIMARY KEY (job_id, event_id)
 );
 
+CREATE TABLE IF NOT EXISTS job_emitted (
+    job_id VARCHAR(64) NOT NULL REFERENCES jobs (job_id),
+    event_id VARCHAR(64) NOT NULL,
+    partition_id INTEGER NOT NULL CHECK (partition_id >= 0),
+    file_ord INTEGER NOT NULL CHECK (file_ord >= 0),
+    emitted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (job_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS job_emitted_partition_idx
+    ON job_emitted (job_id, partition_id);
+CREATE INDEX IF NOT EXISTS job_emitted_file_idx
+    ON job_emitted (job_id, file_ord);
+
 CREATE TABLE IF NOT EXISTS job_progress (
     job_id VARCHAR(64) NOT NULL REFERENCES jobs (job_id),
     partition_id INTEGER NOT NULL CHECK (partition_id >= 0),

@@ -2,8 +2,10 @@
 
 use std::str::FromStr;
 
-use rskafka::client::error::{Error as KafkaError, ProtocolError};
-use rskafka::client::ClientBuilder;
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::client::DefaultClientContext;
+use rdkafka::config::ClientConfig;
+use rdkafka::error::RDKafkaErrorCode;
 use serde::Serialize;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -14,7 +16,6 @@ const POSTGRES_SQL: &str = include_str!("../migrations/postgres/0001_init.sql");
 const MARIADB_SQL: &str = include_str!("../migrations/mariadb/0001_init.sql");
 
 const KAFKA_CLIENT_ID: &str = "distributed-migrate";
-const TOPIC_TIMEOUT_MS: i32 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -105,8 +106,9 @@ impl From<sqlx::Error> for MigrateError {
     }
 }
 
-const MARIADB_TABLES: [&str; 11] = [
+const MARIADB_TABLES: [&str; 12] = [
     "job_lock",
+    "job_emitted",
     "job_clients",
     "job_progress",
     "job_events",
@@ -131,7 +133,50 @@ pub async fn run_fresh(
         Backend::Postgres => reset_postgres(database_url).await?,
         Backend::MariaDb => reset_mariadb(database_url).await?,
     }
+
+    let names = TopicNames::default();
+    let topics = [
+        names.staging.as_str(),
+        names.transactions.as_str(),
+        names.dlq.as_str(),
+    ];
+    delete_topics(kafka_bootstrap, &topics).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
     run(backend, database_url, kafka_bootstrap).await
+}
+
+async fn delete_topics(
+    kafka_bootstrap: &str,
+    topics: &[&str],
+) -> Result<(), MigrateError> {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", kafka_bootstrap)
+        .set("client.id", KAFKA_CLIENT_ID)
+        .create()
+        .map_err(|error| {
+            MigrateError::Kafka(format!("connect to Kafka admin: {error}"))
+        })?;
+
+    let results = admin
+        .delete_topics(topics, &AdminOptions::new())
+        .await
+        .map_err(|error| {
+            MigrateError::Kafka(format!("delete Kafka topics: {error}"))
+        })?;
+
+    for result in results {
+        match result {
+            Ok(_) => {}
+            Err((_, RDKafkaErrorCode::UnknownTopicOrPartition)) => {}
+            Err((name, code)) => {
+                return Err(MigrateError::Kafka(format!(
+                    "delete topic '{name}': {code:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn reset_postgres(database_url: &str) -> Result<(), MigrateError> {
@@ -287,32 +332,40 @@ async fn provision_topics(
     kafka_bootstrap: &str,
     topics: &[(&str, i32)],
 ) -> Result<u32, MigrateError> {
-    let client = ClientBuilder::new(vec![kafka_bootstrap.to_string()])
-        .client_id(KAFKA_CLIENT_ID)
-        .build()
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", kafka_bootstrap)
+        .set("client.id", KAFKA_CLIENT_ID)
+        .create()
+        .map_err(|error| {
+            MigrateError::Kafka(format!("connect to Kafka admin: {error}"))
+        })?;
+
+    let new_topics: Vec<NewTopic<'_>> = topics
+        .iter()
+        .map(|(name, partitions)| {
+            NewTopic::new(name, *partitions, TopicReplication::Fixed(1))
+        })
+        .collect();
+
+    let results = admin
+        .create_topics(&new_topics, &AdminOptions::new())
         .await
-        .map_err(|error| MigrateError::Kafka(format!("connect to Kafka: {error}")))?;
-    let controller = client
-        .controller_client()
-        .map_err(|error| MigrateError::Kafka(format!("discover Kafka controller: {error}")))?;
+        .map_err(|error| {
+            MigrateError::Kafka(format!("create Kafka topics: {error}"))
+        })?;
 
     let mut created = 0;
-    for (name, partitions) in topics {
-        match controller
-            .create_topic(*name, *partitions, 1, TOPIC_TIMEOUT_MS)
-            .await
-        {
-            Ok(()) => created += 1,
-            Err(KafkaError::ServerError {
-                protocol_error: ProtocolError::TopicAlreadyExists,
-                ..
-            }) => {}
-            Err(error) => {
+    for result in results {
+        match result {
+            Ok(_) => created += 1,
+            Err((_, RDKafkaErrorCode::TopicAlreadyExists)) => {}
+            Err((name, code)) => {
                 return Err(MigrateError::Kafka(format!(
-                    "create topic '{name}': {error}"
+                    "create topic '{name}': {code:?}"
                 )));
             }
         }
     }
     Ok(created)
 }
+

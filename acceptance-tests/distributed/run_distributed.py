@@ -94,6 +94,25 @@ def main(argv):
             check=True,
         )
 
+    # Reset the schema and recreate the Kafka topics once per suite so old
+    # staging records cannot leak into the scenarios.
+    subprocess.run(
+        [
+            str(ROOT / "target" / "debug" / "distributed"),
+            "migrate",
+            "--backend",
+            backend,
+            "--fresh",
+            "--json",
+        ],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
     try:
         command = [
             sys.executable,

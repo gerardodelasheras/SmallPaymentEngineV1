@@ -7,8 +7,10 @@
 
 pub mod ingest;
 pub mod kafka_staging;
+pub mod kafka_transactions;
 pub mod manifest;
 pub mod migrate;
+pub mod partition;
 pub mod repository;
 
 use std::collections::HashMap;

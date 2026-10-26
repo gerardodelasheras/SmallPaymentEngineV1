@@ -7,11 +7,12 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 11] = [
     "accounts",
     "clients",
     "id_allocator",
     "job_clients",
+    "job_emitted",
     "job_events",
     "job_files",
     "job_lock",

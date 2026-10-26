@@ -10,8 +10,9 @@ use transaction_processor::{
 };
 
 use super::{
-    entry_state_from_str, entry_state_str, retry_transient, AccountRow, ApplyOutcome, IdBlock,
-    JobProgress, JobState, LedgerEvent, LedgerRepository, RepoError, RowJournal, TransactionRow,
+    entry_state_from_str, entry_state_str, retry_transient, AccountRow, ApplyOutcome,
+    EmittedRow, IdBlock, JobFileRow, JobProgress, JobState, LedgerEvent, LedgerRepository,
+    RepoError, RowJournal, TransactionRow,
 };
 
 pub struct PostgresRepository {
@@ -171,20 +172,81 @@ impl LedgerRepository for PostgresRepository {
         &self,
         job_id: &str,
         partition: i32,
-        count: i64,
-    ) -> Result<(), RepoError> {
-        sqlx::query(
-            "INSERT INTO job_progress (job_id, partition_id, emitted, processed) \
-             VALUES ($1, $2, $3, 0) \
-             ON CONFLICT (job_id, partition_id) DO UPDATE SET \
-             emitted = job_progress.emitted + EXCLUDED.emitted",
+        rows: &[EmittedRow],
+    ) -> Result<u64, RepoError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut db = self.pool.begin().await?;
+        let mut inserted = 0_u64;
+        for row in rows {
+            let file_ord = i32::try_from(row.file_ord).map_err(|_| {
+                RepoError::InvalidState("file ordinal exceeds i32".to_string())
+            })?;
+            let result = sqlx::query(
+                "INSERT INTO job_emitted \
+                 (job_id, event_id, partition_id, file_ord) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            )
+            .bind(job_id)
+            .bind(&row.event_id)
+            .bind(partition)
+            .bind(file_ord)
+            .execute(&mut *db)
+            .await?;
+            inserted += result.rows_affected();
+        }
+
+        if inserted > 0 {
+            sqlx::query(
+                "INSERT INTO job_progress (job_id, partition_id, emitted, processed) \
+                 VALUES ($1, $2, $3, 0) \
+                 ON CONFLICT (job_id, partition_id) DO UPDATE SET \
+                 emitted = job_progress.emitted + EXCLUDED.emitted",
+            )
+            .bind(job_id)
+            .bind(partition)
+            .bind(inserted as i64)
+            .execute(&mut *db)
+            .await?;
+        }
+
+        db.commit().await?;
+        Ok(inserted)
+    }
+
+    async fn job_files(&self, job_id: &str) -> Result<Vec<JobFileRow>, RepoError> {
+        let rows = sqlx::query(
+            "SELECT jf.file_ord, jf.source_id, jf.state, jf.row_count, \
+             (SELECT COUNT(*) FROM job_emitted je \
+              WHERE je.job_id = jf.job_id AND je.file_ord = jf.file_ord) \
+              AS emitted_rows \
+             FROM job_files jf WHERE jf.job_id = $1 ORDER BY jf.file_ord",
         )
         .bind(job_id)
-        .bind(partition)
-        .bind(count)
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(())
+
+        rows.into_iter()
+            .map(|row| {
+                let file_ord: i32 = row.try_get("file_ord")?;
+                let file_ord = u32::try_from(file_ord).map_err(|_| {
+                    RepoError::InvalidState("file ordinal is negative".to_string())
+                })?;
+                let row_count: i64 = row.try_get("row_count")?;
+                let emitted_rows: i64 = row.try_get("emitted_rows")?;
+                Ok(JobFileRow {
+                    file_ord,
+                    source_id: row.try_get("source_id")?,
+                    state: row.try_get("state")?,
+                    row_count: u64::try_from(row_count).map_err(|_| {
+                        RepoError::InvalidState("row count is negative".to_string())
+                    })?,
+                    emitted_rows: u64::try_from(emitted_rows).unwrap_or(0),
+                })
+            })
+            .collect()
     }
 
     async fn job_progress(&self, job_id: &str) -> Result<Vec<JobProgress>, RepoError> {

@@ -38,7 +38,7 @@
 - [x] 4.2 Define and validate the manifest model: source, unique ordinal, hash, location, duplicate/missing/hash-mismatch handling, and manifest hash identity.
 - [x] 4.3 Implement bounded parallel ingestion using the shared CSV parser; stage the parsed transaction plus `(job_id, source_id, external_client, file_ord, row_ord, event_id)`; handle malformed rows without stopping the file.
 - [x] 4.4 Produce staging records keyed by source-scoped external key with an idempotent producer; flush before marking a file complete.
-- [ ] 4.5 Implement the partitioner: consume staging, map external keys to canonical IDs, own each source-scoped client through exactly one staging partition (many clients share a partition; a replica may own several partitions), buffer until earlier files complete, emit in `(file_ord, row_ord)` order keyed by canonical ID, and update emitted progress.
+- [x] 4.5 Implement the partitioner: consume staging, map external keys to canonical IDs, own each source-scoped client through exactly one staging partition (many clients share a partition; a replica may own several partitions), buffer until earlier files complete, emit in `(file_ord, row_ord)` order keyed by canonical ID, and update emitted progress.
 - [ ] 4.6 Bound partitioner buffers and apply Kafka backpressure; expose a stalled-watermark signal.
 - [ ] 4.7 Add restart/resume tests for partial files, re-ingestion idempotency, overlapping-file ordering, and manifest failure -> terminal job failure.
 - [ ] 4.8 Add topic provisioning/partition-count configuration for staging, transactions, and DLQ; document that changing the transactions partition count rekeys clients.

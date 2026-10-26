@@ -105,6 +105,20 @@ CREATE TABLE IF NOT EXISTS job_events (
     CONSTRAINT job_events_event_fk FOREIGN KEY (event_id) REFERENCES ledger_events (event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+CREATE TABLE IF NOT EXISTS job_emitted (
+    job_id VARCHAR(64) NOT NULL,
+    event_id VARCHAR(64) NOT NULL,
+    partition_id INT NOT NULL,
+    file_ord INT NOT NULL,
+    emitted_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (job_id, event_id),
+    KEY job_emitted_partition_idx (job_id, partition_id),
+    KEY job_emitted_file_idx (job_id, file_ord),
+    CONSTRAINT job_emitted_job_fk FOREIGN KEY (job_id) REFERENCES jobs (job_id),
+    CONSTRAINT job_emitted_partition_non_negative CHECK (partition_id >= 0),
+    CONSTRAINT job_emitted_file_ord_non_negative CHECK (file_ord >= 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
 CREATE TABLE IF NOT EXISTS job_progress (
     job_id VARCHAR(64) NOT NULL,
     partition_id INT NOT NULL,

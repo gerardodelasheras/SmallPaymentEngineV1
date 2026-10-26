@@ -399,7 +399,15 @@ class DistributedHarness:
                 "--json",
             ]
         elif stage == "partition":
-            command = ["partition", "--job", job_name]
+            command = [
+                "partition",
+                "--job",
+                job_name,
+                "--drain",
+                "--expect",
+                str(self.staged),
+                "--json",
+            ]
         elif stage == "worker":
             command = ["worker", "--drain", "--job", job_name]
         elif stage == "export":
@@ -432,6 +440,13 @@ class DistributedHarness:
             self.staged = int(report.get("rows_staged", 0))
             self.malformed_reported = int(report.get("rows_rejected", 0)) > 0
             self.manifest_hash = report.get("manifest_hash")
+        if stage == "partition" and completed.returncode == EXIT_OK:
+            report = json.loads(completed.stdout)
+            self.partition_report = report
+            self.order = [
+                (int(entry["file_ord"]), int(entry["row_ord"]))
+                for entry in report.get("emitted", [])
+            ]
         if stage == "migrate" and completed.returncode == EXIT_OK:
             self.seed_identities(backend=backend)
         status = self._classify(stage, completed)
