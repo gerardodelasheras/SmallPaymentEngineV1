@@ -56,35 +56,36 @@
 
 ## 6. Job submission, completion, and export
 
-- [ ] 6.1 Implement job submission with a singleton job lock; reject a second active job as `JobAlreadyActive`; accept a new job after a terminal state.
-- [ ] 6.2 Implement the completion wait: `job_progress.processed == emitted` on every partition with emitted events, plus partitioner completion; never write a partial CSV.
-- [ ] 6.3 Implement the accounts export with the fixed header, canonical `BIGINT` client IDs, touched clients including rejected-row initialization, and sorted/deterministic rows.
-- [ ] 6.4 Implement terminal job failure for hash mismatch, missing files, and poison events; release the lock and allow a later valid job.
-- [ ] 6.5 Implement idempotent resubmission of a completed manifest and prove the exported balances do not change or double-count.
-- [ ] 6.6 Add end-to-end tests for a valid job, a lagging partition, a failed job, a second active job, and a re-submitted manifest.
+- [x] 6.1 Implement job submission with a singleton job lock; reject a second active job as `JobAlreadyActive`; accept a new job after a terminal state.
+- [x] 6.2 Implement the completion wait: `job_progress.processed == emitted` on every partition with emitted events, plus partitioner completion; never write a partial CSV.
+- [x] 6.3 Implement the accounts export with the fixed header, canonical `BIGINT` client IDs, touched clients including rejected-row initialization, and sorted/deterministic rows.
+- [x] 6.4 Implement terminal job failure for hash mismatch, missing files, and poison events; release the lock and allow a later valid job.
+- [x] 6.5 Implement idempotent resubmission of a completed manifest and prove the exported balances do not change or double-count.
+- [x] 6.6 Add end-to-end tests for a valid job, a lagging partition, a failed job, a second active job, and a re-submitted manifest.
 
 ## 7. Operations, configuration, and test infrastructure
 
-- [ ] 7.1 Implement configuration loading with file + environment precedence, required-setting validation, and secret redaction.
-- [ ] 7.2 Implement the health/readiness and metrics surface for consumer lag, DLQ depth, stalled watermarks, failed jobs, and service readiness.
-- [ ] 7.3 Add containerized Kafka/PostgreSQL/MariaDB test infrastructure and a docker-compose or testcontainers profile for the distributed suite.
-- [ ] 7.4 Add optional 3-node Galera conflict/retry integration coverage; keep single-node MariaDB contract tests required.
-- [ ] 7.5 Add topic/DB credential configuration, connection pooling, and graceful shutdown for each service.
+- [x] 7.1 Implement configuration loading with file + environment precedence, required-setting validation, and secret redaction.
+- [x] 7.2 Implement the health/readiness and metrics surface for consumer lag, DLQ depth, stalled watermarks, failed jobs, and service readiness.
+- [x] 7.3 Add containerized Kafka/PostgreSQL/MariaDB test infrastructure and a docker-compose or testcontainers profile for the distributed suite.
+- [x] 7.4 Add optional 3-node Galera conflict/retry integration coverage; keep single-node MariaDB contract tests required.
+  - Note: the required gate is the single-node MariaDB contract test plus the injected certification-conflict retry scenario. A 3-node Galera topology remains an optional manual exercise.
+- [x] 7.5 Add topic/DB credential configuration, connection pooling, and graceful shutdown for each service.
 
 ## 8. Documentation and durable records
 
-- [ ] 8.1 Add distributed README/operations documentation: architecture, manifest format, topics, DB backends, migrations, job lifecycle, retries/DLQ, metrics, limitations, and rollback.
-- [ ] 8.2 Verify `adr/0005-0012-*.md` and the change ADR manifest are consistent; do not edit the existing CLI, `SPEC.md`, or `openspec/specs/` until archive sync.
-- [ ] 8.3 Document the library API break, the canonical-vs-external ID mapping, the single-logical-DB write ceiling, serialized jobs, and unbounded journal/idempotency retention.
+- [x] 8.1 Add distributed README/operations documentation: architecture, manifest format, topics, DB backends, migrations, job lifecycle, retries/DLQ, metrics, limitations, and rollback.
+- [x] 8.2 Verify `adr/0005-0012-*.md` and the change ADR manifest are consistent; do not edit the existing CLI, `SPEC.md`, or `openspec/specs/` until archive sync.
+- [x] 8.3 Document the library API break, the canonical-vs-external ID mapping, the single-logical-DB write ceiling, serialized jobs, and unbounded journal/idempotency retention.
 
 ## 9. Full verification
 
-- [ ] 9.1 Run `cargo test` for the existing package and the distributed crate.
-- [ ] 9.2 Run `./tests/run_tests.sh`; the existing CLI fixtures must remain unchanged and green.
-- [ ] 9.3 Run the existing CLI acceptance suite; it must remain green.
-- [ ] 9.4 Run the distributed acceptance suite; every scenario passes with zero pending/undefined steps and the report is generated.
-- [ ] 9.5 Run the cross-variant conformance suite on generated inputs and compare CLI vs distributed balances, journal state, and lock state.
-- [ ] 9.6 Run PostgreSQL and MariaDB contract tests; run Galera conflict tests where available.
-- [ ] 9.7 Run `openspec validate kafka-distributed-ledger --type change --strict` (or the supported equivalent) and confirm the change is valid.
-- [ ] 9.8 Review the effective spec and confirm the CLI specs and the six new capabilities compose without duplicate or missing scenarios.
+- [x] 9.1 Run `cargo test` for the existing package and the distributed crate.
+- [x] 9.2 Run `./tests/run_tests.sh`; the existing CLI fixtures must remain unchanged and green.
+- [x] 9.3 Run the existing CLI acceptance suite; it must remain green.
+- [x] 9.4 Run the distributed acceptance suite; every scenario passes with zero pending/undefined steps and the report is generated.
+- [x] 9.5 Run the cross-variant conformance suite on generated inputs and compare CLI vs distributed balances, journal state, and lock state.
+- [x] 9.6 Run PostgreSQL and MariaDB contract tests; run Galera conflict tests where available.
+- [x] 9.7 Run `openspec validate kafka-distributed-ledger --type change --strict` (or the supported equivalent) and confirm the change is valid.
+- [x] 9.8 Review the effective spec and confirm the CLI specs and the six new capabilities compose without duplicate or missing scenarios.
 - [ ] 9.9 Confirm specs-zone and code-zone changes are committed separately with user approval; do not auto-commit or archive from a feature branch.

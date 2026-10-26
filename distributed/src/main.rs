@@ -40,7 +40,12 @@ Commands:
   ingest      Parse a manifest and stage rows
   partition   Map staged clients and emit ordered transactions
   worker      Consume transactions and apply the durable ledger
+  config      Show the effective, redacted configuration
+  health      Report broker and database readiness
+  metrics     Report lag, DLQ depth, stalled watermarks, and failed jobs
+  identity    Mint or look up a canonical client ID
   journal     Query the durable transaction journal
+  job         Query job status
   dlq         Query the dead-letter path
   export      Wait for a job and write its accounts CSV
   migrate     Apply database migrations and provision topics
@@ -81,11 +86,27 @@ partition options:
   --expect <n>                   Rows expected in a drain run
   --idle-exit <secs>             Group mode: exit after this much idle
   --startup-delay <ms>           Group mode: wait before processing
+  --partition <id>               Drain mode: only this partition (repeatable)
   --max-buffered-rows <n>        Default: 100000
   --stall-timeout <secs>         Drain mode stall timeout (default: 5)
 
+export options:
+  --job <id>                     Job to export
+  --out <path>                   CSV destination
+  --check                        Report readiness without writing the CSV
+  --timeout <secs>               Wait budget (default: 120)
+
+job options:
+  status --job <id>              Report state and partition progress
+
 journal options:
   --tx <id>                      Transaction id to query
+
+config options:
+  show                           Print the effective configuration
+
+identity options:
+  mint --source <id> --client <n>  Mint or get the canonical BIGINT ID
 
 dlq options:
   list                           List dead-letter records
@@ -101,6 +122,7 @@ enum CommandError {
     #[error(transparent)]
     Repo(#[from] RepoError),
 
+
     #[error(transparent)]
     Manifest(#[from] manifest::ManifestError),
 
@@ -113,8 +135,14 @@ enum CommandError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("job failed: {0}")]
     JobFailed(String),
+
+    #[error("job rejected: {0}")]
+    JobRejected(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -193,10 +221,44 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        "identity" => match run_identity(&args[2..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("distributed: identity failed: {error}");
+                ExitCode::from(1)
+            }
+        },
         "dlq" => match run_dlq(&args[2..]).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("distributed: dlq failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        "config" => match run_config(&args[2..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("distributed: config failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        "health" => match run_health(&args[2..]).await {
+            Ok(ready) => {
+                if ready {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                }
+            }
+            Err(error) => {
+                eprintln!("distributed: health failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        "metrics" => match run_metrics(&args[2..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("distributed: metrics failed: {error}");
                 ExitCode::from(1)
             }
         },
@@ -207,10 +269,28 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        "export" => {
-            eprintln!("distributed: 'export' is not implemented yet");
-            ExitCode::from(1)
-        }
+        "export" => match run_export(&args[2..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(CommandError::JobFailed(message)) => {
+                eprintln!("distributed: export failed: {message}");
+                ExitCode::from(3)
+            }
+            Err(CommandError::JobRejected(message)) => {
+                eprintln!("distributed: export rejected: {message}");
+                ExitCode::from(2)
+            }
+            Err(error) => {
+                eprintln!("distributed: export failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        "job" => match run_job_command(&args[2..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("distributed: job failed: {error}");
+                ExitCode::from(1)
+            }
+        },
         other => {
             eprintln!("distributed: unknown command '{other}'\n\n{USAGE}");
             ExitCode::from(2)
@@ -236,6 +316,7 @@ fn ingest_exit_code(error: &CommandError) -> u8 {
     match error {
         CommandError::Manifest(error) => manifest_exit_code(error),
         CommandError::Ingest(IngestError::Manifest(error)) => manifest_exit_code(error),
+        CommandError::Repo(RepoError::JobAlreadyActive { .. }) => 2,
         _ => 1,
     }
 }
@@ -249,6 +330,15 @@ fn take_value(args: &[String], index: &mut usize) -> Result<String, CommandError
     Ok(value.clone())
 }
 
+/// Infer the backend from `DATABASE_URL` so `mysql://` URLs do not require a
+/// repeated `--backend mariadb` flag. An explicit `--backend` still wins.
+fn default_backend() -> Backend {
+    match env::var("DATABASE_URL") {
+        Ok(url) if url.trim_start().starts_with("mysql://") => Backend::MariaDb,
+        _ => Backend::Postgres,
+    }
+}
+
 fn parse_backend(value: &str) -> Result<Backend, CommandError> {
     value
         .parse::<Backend>()
@@ -256,7 +346,7 @@ fn parse_backend(value: &str) -> Result<Backend, CommandError> {
 }
 
 async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
-    let mut backend = Backend::Postgres;
+    let mut backend = default_backend();
     let mut database_url = env::var("DATABASE_URL").ok();
     let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
     let mut staging_topic = "staging".to_string();
@@ -421,7 +511,7 @@ async fn connect_ledger_repository(
 async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
     let mut manifest_path: Option<String> = None;
     let mut job_id: Option<String> = None;
-    let mut backend = Backend::Postgres;
+    let mut backend = default_backend();
     let mut database_url = env::var("DATABASE_URL").ok();
     let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
     let mut staging_topic = "staging".to_string();
@@ -507,7 +597,7 @@ async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
     let repository = connect_ledger_repository(backend, &database_url).await?;
 
     repository
-        .create_job(&job_id, &manifest.manifest_hash)
+        .submit_job(&job_id, &manifest.manifest_hash)
         .await?;
 
     let inputs: Vec<JobFileInput> = manifest
@@ -529,7 +619,7 @@ async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
         sink = sink.with_stage_limit(limit);
     }
     let sink = Arc::new(sink);
-    let summary = ingest(
+    let summary = match ingest(
         &manifest,
         &job_id,
         sink,
@@ -537,7 +627,16 @@ async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
             max_concurrent_files,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            repository
+                .finish_job(&job_id, JobState::Failed, Some(&error.to_string()))
+                .await?;
+            return Err(CommandError::Ingest(error));
+        }
+    };
 
     let report = IngestReport {
         job_id,
@@ -641,7 +740,7 @@ fn commit_ready(
 }
 
 async fn run_partition(args: &[String]) -> Result<(), CommandError> {
-    let mut backend = Backend::Postgres;
+    let mut backend = default_backend();
     let mut database_url = env::var("DATABASE_URL").ok();
     let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
     let mut staging_topic = "staging".to_string();
@@ -653,6 +752,7 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
     let mut stall_timeout = Duration::from_secs(5);
     let mut idle_exit: Option<Duration> = None;
     let mut startup_delay: Option<Duration> = None;
+    let mut explicit_partitions: Vec<i32> = Vec::new();
     let mut drain = false;
     let mut json = false;
 
@@ -709,6 +809,14 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                     )
                 })?;
                 startup_delay = Some(Duration::from_millis(millis));
+            }
+            "--partition" => {
+                let value = take_value(args, &mut index)?;
+                explicit_partitions.push(value.parse::<i32>().map_err(|_| {
+                    CommandError::Config(
+                        "--partition must be a partition id".to_string(),
+                    )
+                })?);
             }
             "--drain" => {
                 drain = true;
@@ -783,6 +891,11 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                 continue;
             }
             for partition in topic.partitions() {
+                if !explicit_partitions.is_empty()
+                    && !explicit_partitions.contains(&partition.id())
+                {
+                    continue;
+                }
                 offsets
                     .add_partition_offset(
                         &staging_topic,
@@ -836,6 +949,10 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
 
     loop {
         tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received shutdown signal; draining in-flight work");
+                break;
+            }
             _ = interval.tick() => {
                 let emitted = engine.tick().await?;
                 if !emitted.is_empty() {
@@ -1034,7 +1151,7 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
 }
 
 async fn run_worker(args: &[String]) -> Result<(), CommandError> {
-    let mut backend = Backend::Postgres;
+    let mut backend = default_backend();
     let mut database_url = env::var("DATABASE_URL").ok();
     let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
     let mut transactions_topic = "transactions".to_string();
@@ -1204,6 +1321,10 @@ async fn run_worker(args: &[String]) -> Result<(), CommandError> {
 
     loop {
         tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received shutdown signal; draining in-flight work");
+                break;
+            }
             _ = interval.tick() => {
                 if drain && records_seen >= expected {
                     break;
@@ -1394,7 +1515,7 @@ async fn run_worker(args: &[String]) -> Result<(), CommandError> {
 }
 
 async fn run_journal(args: &[String]) -> Result<(), CommandError> {
-    let mut backend = Backend::Postgres;
+    let mut backend = default_backend();
     let mut database_url = env::var("DATABASE_URL").ok();
     let mut tx_id: Option<u32> = None;
     let mut json = false;
@@ -1506,6 +1627,445 @@ async fn run_dlq(args: &[String]) -> Result<(), CommandError> {
                 record.job_id, record.file_ord, record.row_ord, record.error
             );
         }
+    }
+    Ok(())
+}
+
+async fn run_job_command(args: &[String]) -> Result<(), CommandError> {
+    if args.first().map(String::as_str) != Some("status") {
+        return Err(CommandError::Config(
+            "job requires the 'status' subcommand".to_string(),
+        ));
+    }
+    let mut index = 1;
+    let mut backend = default_backend();
+    let mut database_url = env::var("DATABASE_URL").ok();
+    let mut job_id: Option<String> = None;
+    let mut json = false;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--backend" => {
+                let value = take_value(args, &mut index)?;
+                backend = parse_backend(&value)?;
+            }
+            "--database-url" => database_url = Some(take_value(args, &mut index)?),
+            "--job" => job_id = Some(take_value(args, &mut index)?),
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => {
+                return Err(CommandError::Config(format!(
+                    "unknown job option '{other}'"
+                )));
+            }
+        }
+    }
+
+    let database_url = database_url.ok_or_else(|| {
+        CommandError::Config("DATABASE_URL or --database-url is required".to_string())
+    })?;
+    let job_id = job_id.ok_or_else(|| {
+        CommandError::Config("--job is required".to_string())
+    })?;
+    let repository = connect_ledger_repository(backend, &database_url).await?;
+    let status = repository.job_status(&job_id).await?;
+    let progress: Vec<serde_json::Value> = status
+        .progress
+        .iter()
+        .map(|progress| {
+            serde_json::json!({
+                "partition": progress.partition,
+                "emitted": progress.emitted,
+                "processed": progress.processed,
+            })
+        })
+        .collect();
+    let report = serde_json::json!({
+        "job_id": status.job_id,
+        "state": status.state.as_str(),
+        "failure_reason": status.failure_reason,
+        "partitioner_complete": status.partitioner_complete,
+        "ready": status.is_complete(),
+        "progress": progress,
+    });
+    if json {
+        println!("{report}");
+    } else {
+        println!(
+            "job={} state={} ready={} partitioner_complete={}",
+            report["job_id"], report["state"], report["ready"], report["partitioner_complete"]
+        );
+    }
+    Ok(())
+}
+
+async fn run_export(args: &[String]) -> Result<(), CommandError> {
+    let mut backend = default_backend();
+    let mut database_url = env::var("DATABASE_URL").ok();
+    let mut job_id: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut check = false;
+    let mut json = false;
+    let mut timeout = Duration::from_secs(120);
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--backend" => {
+                let value = take_value(args, &mut index)?;
+                backend = parse_backend(&value)?;
+            }
+            "--database-url" => database_url = Some(take_value(args, &mut index)?),
+            "--job" => job_id = Some(take_value(args, &mut index)?),
+            "--out" => out_path = Some(take_value(args, &mut index)?),
+            "--timeout" => {
+                let value = take_value(args, &mut index)?;
+                let seconds = value.parse::<u64>().map_err(|_| {
+                    CommandError::Config(
+                        "--timeout must be a non-negative integer".to_string(),
+                    )
+                })?;
+                timeout = Duration::from_secs(seconds);
+            }
+            "--check" => {
+                check = true;
+                index += 1;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => {
+                return Err(CommandError::Config(format!(
+                    "unknown export option '{other}'"
+                )));
+            }
+        }
+    }
+
+    let database_url = database_url.ok_or_else(|| {
+        CommandError::Config("DATABASE_URL or --database-url is required".to_string())
+    })?;
+    let job_id = job_id.ok_or_else(|| {
+        CommandError::Config("--job is required".to_string())
+    })?;
+    let out_path = out_path.ok_or_else(|| {
+        CommandError::Config("--out is required".to_string())
+    })?;
+
+    let repository = connect_ledger_repository(backend, &database_url).await?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let status = repository.job_status(&job_id).await?;
+        match status.state {
+            JobState::Failed => {
+                let reason = status
+                    .failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "job failed".to_string());
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "job_id": status.job_id,
+                            "state": status.state.as_str(),
+                            "ready": false,
+                            "failure_reason": status.failure_reason,
+                        })
+                    );
+                }
+                return Err(CommandError::JobFailed(reason));
+            }
+            JobState::Rejected => {
+                let reason = status
+                    .failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "job rejected".to_string());
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "job_id": status.job_id,
+                            "state": status.state.as_str(),
+                            "ready": false,
+                            "failure_reason": status.failure_reason,
+                        })
+                    );
+                }
+                return Err(CommandError::JobRejected(reason));
+            }
+            JobState::Running | JobState::Completed => {}
+        }
+
+        let ready = status.is_complete();
+        if check {
+            let report = serde_json::json!({
+                "job_id": status.job_id,
+                "state": status.state.as_str(),
+                "ready": ready,
+                "partitioner_complete": status.partitioner_complete,
+                "progress": status.progress.iter().map(|progress| serde_json::json!({
+                    "partition": progress.partition,
+                    "emitted": progress.emitted,
+                    "processed": progress.processed,
+                })).collect::<Vec<_>>(),
+            });
+            if json {
+                println!("{report}");
+            } else {
+                println!(
+                    "job={} state={} ready={ready}",
+                    report["job_id"], report["state"]
+                );
+            }
+            return Ok(());
+        }
+
+        if ready {
+            if status.state == JobState::Running {
+                repository
+                    .finish_job(&job_id, JobState::Completed, None)
+                    .await?;
+            }
+            let accounts = repository.accounts_for_job(&job_id).await?;
+            let temporary = format!("{out_path}.tmp");
+            {
+                let file = std::fs::File::create(&temporary)?;
+                let mut writer = std::io::BufWriter::new(file);
+                distributed::job_export::write_accounts(&mut writer, &accounts)?;
+                std::io::Write::flush(&mut writer)?;
+            }
+            std::fs::rename(&temporary, &out_path)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "job_id": job_id,
+                        "state": JobState::Completed.as_str(),
+                        "accounts": accounts.len(),
+                        "out": out_path,
+                    })
+                );
+            }
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(CommandError::Config(format!(
+                "job {job_id} did not drain before the export timeout"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn run_identity(args: &[String]) -> Result<(), CommandError> {
+    if args.first().map(String::as_str) != Some("mint") {
+        return Err(CommandError::Config(
+            "identity requires the 'mint' subcommand".to_string(),
+        ));
+    }
+    let mut index = 1;
+    let mut backend = default_backend();
+    let mut database_url = env::var("DATABASE_URL").ok();
+    let mut source_id: Option<String> = None;
+    let mut external_client: Option<u16> = None;
+    let mut json = false;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--backend" => {
+                let value = take_value(args, &mut index)?;
+                backend = parse_backend(&value)?;
+            }
+            "--database-url" => database_url = Some(take_value(args, &mut index)?),
+            "--source" => source_id = Some(take_value(args, &mut index)?),
+            "--client" => {
+                let value = take_value(args, &mut index)?;
+                external_client = Some(value.parse::<u16>().map_err(|_| {
+                    CommandError::Config(
+                        "--client must be between 0 and 65535".to_string(),
+                    )
+                })?);
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => {
+                return Err(CommandError::Config(format!(
+                    "unknown identity option '{other}'"
+                )));
+            }
+        }
+    }
+
+    let database_url = database_url.ok_or_else(|| {
+        CommandError::Config("DATABASE_URL or --database-url is required".to_string())
+    })?;
+    let source_id = source_id.ok_or_else(|| {
+        CommandError::Config("--source is required".to_string())
+    })?;
+    let external_client = external_client.ok_or_else(|| {
+        CommandError::Config("--client is required".to_string())
+    })?;
+
+    let repository = connect_ledger_repository(backend, &database_url).await?;
+    let client_id = repository
+        .mint_or_get_client(&source_id, external_client)
+        .await?;
+    let report = serde_json::json!({
+        "source_id": source_id,
+        "external_client": external_client,
+        "client_id": client_id,
+    });
+    if json {
+        println!("{report}");
+    } else {
+        println!("client_id={client_id}");
+    }
+    Ok(())
+}
+
+async fn run_config(args: &[String]) -> Result<(), CommandError> {
+    if args.first().map(String::as_str) != Some("show") {
+        return Err(CommandError::Config(
+            "config requires the 'show' subcommand".to_string(),
+        ));
+    }
+    let config = distributed::config::Config::load()
+        .map_err(CommandError::Config)?;
+    println!("{}", serde_json::to_string(&config)?);
+    Ok(())
+}
+
+async fn run_health(args: &[String]) -> Result<bool, CommandError> {
+    let mut json = false;
+    for argument in args {
+        match argument.as_str() {
+            "--json" => json = true,
+            other => {
+                return Err(CommandError::Config(format!(
+                    "unknown health option '{other}'"
+                )));
+            }
+        }
+    }
+
+    let config = distributed::config::Config::load()
+        .map_err(CommandError::Config)?;
+    let broker = config.require_broker().map_err(CommandError::Config)?;
+    let database_url = config
+        .require_database()
+        .map_err(CommandError::Config)?;
+    let backend = default_backend();
+
+    let database_ready = connect_ledger_repository(backend, database_url)
+        .await
+        .is_ok();
+    let broker_ready = rdkafka::consumer::BaseConsumer::from(
+        rdkafka::config::ClientConfig::new()
+            .set("bootstrap.servers", broker)
+            .set("group.id", "distributed-health")
+            .set("socket.timeout.ms", "5000")
+            .create::<rdkafka::consumer::BaseConsumer>()
+            .map_err(|error| {
+                CommandError::Config(format!(
+                    "broker configuration is invalid: {error}"
+                ))
+            })?,
+    )
+    .fetch_metadata(None, Duration::from_secs(5))
+    .is_ok();
+
+    let ready = database_ready && broker_ready;
+    let report = serde_json::json!({
+        "ready": ready,
+        "database": if database_ready { "ok" } else { "unavailable" },
+        "broker": if broker_ready { "ok" } else { "unavailable" },
+        "backend": backend.as_str(),
+    });
+    if json {
+        println!("{report}");
+    } else {
+        println!(
+            "ready={} database={} broker={}",
+            report["ready"], report["database"], report["broker"]
+        );
+    }
+    Ok(ready)
+}
+
+async fn run_metrics(args: &[String]) -> Result<(), CommandError> {
+    let mut json = false;
+    for argument in args {
+        match argument.as_str() {
+            "--json" => json = true,
+            other => {
+                return Err(CommandError::Config(format!(
+                    "unknown metrics option '{other}'"
+                )));
+            }
+        }
+    }
+
+    let config = distributed::config::Config::load()
+        .map_err(CommandError::Config)?;
+    let database_url = config
+        .require_database()
+        .map_err(CommandError::Config)?;
+    let backend = default_backend();
+    let repository = connect_ledger_repository(backend, database_url).await?;
+    let jobs = repository.job_metrics().await?;
+
+    let mut stalled_watermarks = Vec::new();
+    let mut job_states = serde_json::Map::new();
+    let mut failed_jobs = 0_i64;
+    let mut consumer_lag = 0_i64;
+    for job in &jobs {
+        job_states.insert(
+            job.job_id.clone(),
+            serde_json::Value::String(job.state.as_str().to_string()),
+        );
+        consumer_lag += job.pending_events;
+        if job.state == JobState::Failed {
+            failed_jobs += 1;
+        }
+        if job.state == JobState::Running
+            && (!job.partitioner_complete || job.pending_events > 0)
+        {
+            stalled_watermarks.push(job.job_id.clone());
+        }
+    }
+
+    let dlq_depth = match config.kafka_bootstrap.as_deref() {
+        Some(bootstrap) => distributed::kafka_dlq::list(bootstrap, "dlq", None)
+            .await
+            .map(|records| records.len() as i64)
+            .unwrap_or(0),
+        None => 0,
+    };
+
+    let report = serde_json::json!({
+        "consumer_lag": consumer_lag,
+        "dlq_depth": dlq_depth,
+        "failed_jobs": failed_jobs,
+        "stalled_watermarks": stalled_watermarks,
+        "job_states": job_states,
+    });
+    if json {
+        println!("{report}");
+    } else {
+        println!(
+            "consumer_lag={} dlq_depth={} failed_jobs={} stalled={:?}",
+            report["consumer_lag"],
+            report["dlq_depth"],
+            report["failed_jobs"],
+            report["stalled_watermarks"]
+        );
     }
     Ok(())
 }

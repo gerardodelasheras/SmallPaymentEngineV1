@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -94,25 +95,38 @@ def main(argv):
             check=True,
         )
 
-    # Reset the schema and recreate the Kafka topics once per suite so old
-    # staging records cannot leak into the scenarios.
-    subprocess.run(
-        [
-            str(ROOT / "target" / "debug" / "distributed"),
-            "migrate",
-            "--backend",
-            backend,
-            "--fresh",
-            "--fresh-topics",
-            "--json",
-        ],
-        cwd=ROOT,
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    # Reset the schema and recreate the Kafka topics once per suite. A cold
+    # broker can take a while to elect topic leaders, so retry the setup instead
+    # of failing the whole suite on the first attempt.
+    reset_command = [
+        str(ROOT / "target" / "debug" / "distributed"),
+        "migrate",
+        "--backend",
+        backend,
+        "--fresh",
+        "--fresh-topics",
+        "--json",
+    ]
+    last_error = None
+    for attempt in range(1, 6):
+        completed = subprocess.run(
+            reset_command,
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if completed.returncode == 0:
+            break
+        last_error = completed.stderr.strip()
+        sys.stderr.write(
+            "[distributed-acceptance] suite reset attempt %d failed: %s\n"
+            % (attempt, last_error)
+        )
+        time.sleep(3)
+    else:
+        raise SystemExit(f"suite reset failed: {last_error}")
 
     try:
         command = [

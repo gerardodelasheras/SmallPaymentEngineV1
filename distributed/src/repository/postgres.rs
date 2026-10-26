@@ -12,8 +12,9 @@ use transaction_processor::{
 
 use super::{
     entry_state_from_str, entry_state_str, retry_transient, AccountRow, ApplyOutcome,
-    EmittedRow, FileCompletionRow, IdBlock, JobFileInput, JobFileRow, JobProgress, JobState,
-    LedgerEvent, LedgerRepository, RepoError, RowJournal, TransactionRow,
+    EmittedRow, FileCompletionRow, IdBlock, JobFileInput, JobFileRow,
+    JobProgress, JobState, JobMetrics, JobStatus, LedgerEvent, LedgerRepository, RepoError, RowJournal,
+    TransactionRow,
 };
 
 pub struct PostgresRepository {
@@ -59,12 +60,100 @@ impl LedgerRepository for PostgresRepository {
         Ok(())
     }
 
+    async fn submit_job(&self, job_id: &str, manifest_hash: &str) -> Result<(), RepoError> {
+        let mut db = self.pool.begin().await?;
+        let active: Option<String> = sqlx::query_scalar(
+            "SELECT active_job_id FROM job_lock WHERE lock_id = 1 FOR UPDATE",
+        )
+        .fetch_one(&mut *db)
+        .await?;
+        if let Some(active) = active {
+            if active != job_id {
+                return Err(RepoError::JobAlreadyActive { active });
+            }
+        }
+        sqlx::query(
+            "INSERT INTO jobs (job_id, manifest_hash, state) \
+             VALUES ($1, $2, 'running') ON CONFLICT (job_id) DO NOTHING",
+        )
+        .bind(job_id)
+        .bind(manifest_hash)
+        .execute(&mut *db)
+        .await?;
+        sqlx::query(
+            "UPDATE job_lock SET active_job_id = $1, acquired_at = now() WHERE lock_id = 1",
+        )
+        .bind(job_id)
+        .execute(&mut *db)
+        .await?;
+        db.commit().await?;
+        Ok(())
+    }
+
+    async fn job_status(&self, job_id: &str) -> Result<JobStatus, RepoError> {
+        let row = sqlx::query("SELECT state, failure_reason FROM jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| RepoError::JobNotFound(job_id.to_string()))?;
+        let state: String = row.try_get("state")?;
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_files jf \
+             WHERE jf.job_id = $1 AND (jf.state <> 'complete' OR jf.row_count <> (\
+                 SELECT COUNT(*) FROM job_emitted je \
+                 WHERE je.job_id = jf.job_id AND je.file_ord = jf.file_ord))",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(JobStatus {
+            job_id: job_id.to_string(),
+            state: JobState::parse(&state)?,
+            failure_reason: row.try_get("failure_reason")?,
+            progress: self.job_progress(job_id).await?,
+            partitioner_complete: pending == 0,
+        })
+    }
+
+    async fn job_metrics(&self) -> Result<Vec<JobMetrics>, RepoError> {
+        let rows = sqlx::query(
+            "SELECT j.job_id, j.state, \
+             (SELECT COUNT(*) FROM job_files jf WHERE jf.job_id = j.job_id AND (\
+                 jf.state <> 'complete' OR jf.row_count <> (\
+                     SELECT COUNT(*) FROM job_emitted je \
+                     WHERE je.job_id = jf.job_id AND je.file_ord = jf.file_ord))) AS pending_files, \
+             COALESCE((SELECT SUM(jp.emitted - jp.processed) FROM job_progress jp \
+                 WHERE jp.job_id = j.job_id), 0)::BIGINT AS pending_events \
+             FROM jobs j ORDER BY j.job_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let job_id: String = row.try_get("job_id")?;
+                let pending_files: i64 = row.try_get("pending_files")?;
+                let pending_events: i64 = row.try_get("pending_events")?;
+                let state: String = row.try_get("state")?;
+                let state = JobState::parse(&state)?;
+                Ok(JobMetrics {
+                    job_id,
+                    state,
+                    partitioner_complete: pending_files == 0,
+                    pending_events,
+                })
+            })
+            .collect()
+    }
+
     async fn finish_job(
         &self,
         job_id: &str,
         state: JobState,
         failure_reason: Option<&str>,
     ) -> Result<(), RepoError> {
+        let mut db = self.pool.begin().await?;
         sqlx::query(
             "UPDATE jobs SET state = $2, failure_reason = $3, \
              updated_at = now(), completed_at = now() WHERE job_id = $1",
@@ -72,8 +161,16 @@ impl LedgerRepository for PostgresRepository {
         .bind(job_id)
         .bind(state.as_str())
         .bind(failure_reason)
-        .execute(&self.pool)
+        .execute(&mut *db)
         .await?;
+        sqlx::query(
+            "UPDATE job_lock SET active_job_id = NULL, acquired_at = NULL \
+             WHERE lock_id = 1 AND active_job_id = $1",
+        )
+        .bind(job_id)
+        .execute(&mut *db)
+        .await?;
+        db.commit().await?;
         Ok(())
     }
 

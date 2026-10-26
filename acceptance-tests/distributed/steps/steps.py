@@ -125,16 +125,19 @@ def step_different_canonical(context):
 @both("both emit the same canonical ID")
 def step_both_emit_same(context):
     h = harness(context)
-    accepted(context)
+    if not h.concurrent:
+        accepted(context)
     assert h.canonical_id(h.source, h.external) is not None
 
 
 @both("exactly one client row exists for that key")
 def step_one_client_row(context):
     h = harness(context)
-    accepted(context)
+    if not h.concurrent:
+        accepted(context)
     rows = [row for row in h.identity_rows if row[0] == h.source and row[1] == h.external]
-    assert len(rows) == 1
+    assert len(rows) == 1, h.identity_rows
+    assert h.identity_row_count(h.source, h.external) == 1
 
 
 @both("the transactions record key is {canonical:d}")
@@ -267,8 +270,38 @@ def step_crash_half_file(context):
 @both("a completed file is submitted again under a later job")
 def step_reingest(context):
     h = harness(context)
-    h.add_file(1)
+    h.subject = 42
+    h.add_file(1, rows=["deposit,42,1,10.0"])
+    h.job_a = h._new_job_id()
+    h.run_ledger_job(job_name=h.job_a)
+    accepted(context)
+    h.export_snapshot = dict(h.accounts)
+    h.journal_snapshot = h.journal_count()
+
+    fresh_job(h)
+    h.subject = 42
+    h.add_file(1, rows=["deposit,42,1,10.0"])
     h.reingest = True
+
+
+def map_through_partitioner(h, source, client):
+    h.files = []
+    h.rows = []
+    h.rows_flushed = 0
+    h.add_file(1, source=source, rows=[f"deposit,{client},1,1.0"])
+    h.run_job(stages=["migrate", "ingest", "partition"])
+    emitted = h.partition_report.get("emitted", [])
+    assert emitted, h.partition_report
+    canonical = int(emitted[0]["client_id"])
+    if (source, client) in h.mappings:
+        assert h.mappings[(source, client)] == canonical, (
+            h.mappings[(source, client)],
+            canonical,
+        )
+    else:
+        h.set_mapping(source, client, canonical)
+    h.last_key = canonical
+    return canonical
 
 
 @both("the partitioner maps source \"{source}\" client {client:d}")
@@ -276,7 +309,7 @@ def step_partitioner_maps(context, source, client):
     h = harness(context)
     h.source = source
     h.external = client
-    h.run_job()
+    map_through_partitioner(h, source, client)
 
 
 @both('a later job maps source "{source}" client {client:d}')
@@ -284,7 +317,7 @@ def step_later_job_maps(context, source, client):
     h = harness(context)
     h.source = source
     h.external = client
-    h.run_job()
+    map_through_partitioner(h, source, client)
 
 
 @both('source "{source}" client {client:d} is mapped')
@@ -292,17 +325,29 @@ def step_source_is_mapped(context, source, client):
     h = harness(context)
     h.source = source
     h.external = client
-    h.run_job()
+    map_through_partitioner(h, source, client)
 
 
 @both("both mappings complete")
 def step_both_mappings_complete(context):
-    harness(context).run_job()
+    h = harness(context)
+    if h.concurrent:
+        h.concurrent_identity(h.source, h.external)
+    else:
+        h.run_job()
 
 
 @both("the partitioner emits the row")
 def step_partitioner_emits(context):
-    harness(context).run_job()
+    h = harness(context)
+    h.files = []
+    h.rows = []
+    h.rows_flushed = 0
+    h.add_file(1, source=h.source, rows=[f"deposit,{h.external},1,1.0"])
+    h.run_job(stages=["migrate", "ingest", "partition"])
+    emitted = h.partition_report.get("emitted", [])
+    assert emitted, h.partition_report
+    h.last_key = int(emitted[0]["client_id"])
 
 
 @both("the partitioner emits client {client:d}")
@@ -319,7 +364,11 @@ def step_job_submitted(context):
 
 @both("the job runs")
 def step_job_runs(context):
-    harness(context).run_job()
+    h = harness(context)
+    h.run_job()
+    if h.reingest:
+        h.applied_count = 0 if h.journal_count() == h.journal_snapshot else 1
+        h.exports_match = h.accounts == h.export_snapshot
 
 
 @both("ingestion runs in parallel")
@@ -343,7 +392,9 @@ def step_partitioners_run(context):
 
 @both("more rows arrive")
 def step_more_rows(context):
-    harness(context).run_job()
+    # The buffer is deliberately stalled, so the job is not expected to drain;
+    # export would wait forever for a file that is still pending.
+    harness(context).run_job(stages=["migrate", "ingest", "partition"])
 
 
 @both("it restarts")

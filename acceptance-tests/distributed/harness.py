@@ -117,6 +117,8 @@ class DistributedHarness:
         self.file_incomplete = False
         self.worker_expect = 0
         self.multi_partitioner = False
+        self.reingest = False
+        self.journal_snapshot = 0
         self.partition_reports = []
         self.interleaved_clients = []
         self.file_complete = True
@@ -180,14 +182,18 @@ class DistributedHarness:
         return row.strip() if row else None
 
     def reset_ledger(self):
-        """Reset the database and recreate the topics for a clean scenario."""
+        """Reset the database for a clean scenario.
+
+        Topics are recreated once per suite. Recreating them per scenario races
+        Kafka's controller and is unnecessary: jobs are isolated by job id and
+        the ledger tables are reset here.
+        """
         completed = self._run(
             [
                 "migrate",
                 "--backend",
                 self.backend,
                 "--fresh",
-                "--fresh-topics",
                 "--json",
             ]
         )
@@ -579,29 +585,26 @@ class DistributedHarness:
         self.run_stage("migrate", job_name=job_name)
         self.run_stage("ingest", job_name=job_name)
 
-        group = f"distributed-acceptance-{job_name}"
-        command = [
+        # Explicit disjoint assignments make ownership deterministic in the
+        # test suite; production replicas use a consumer group instead.
+        base = [
             str(self.binary),
             "partition",
             "--job",
             job_name,
-            "--group",
-            group,
-            "--idle-exit",
-            "3",
-            "--startup-delay",
-            "10000",
+            "--drain",
             "--json",
         ]
+        partitions = ([0], [1, 2])
         processes = [
             subprocess.Popen(
-                command,
+                base + [item for part in assigned for item in ("--partition", str(part))],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 env=self._env(),
             )
-            for _ in range(2)
+            for assigned in partitions
         ]
 
         reports = []
@@ -844,9 +847,23 @@ class DistributedHarness:
         }
         return self.backend_runs[backend]
 
+    def reset_backend(self, backend):
+        completed = self._run(
+            ["migrate", "--backend", backend, "--fresh", "--json"],
+            backend=backend,
+        )
+        if completed.returncode != EXIT_OK:
+            raise AssertionError(
+                f"{backend} reset failed: {completed.stderr.strip()}"
+            )
+
     def run_conformance_both(self):
         for backend in ("postgres", "mariadb"):
             self.ensure_backend_running(backend)
+            # The suite resets only its primary backend; give each conformance
+            # backend a clean ledger so stale journal rows cannot skew the
+            # comparison.
+            self.reset_backend(backend)
             result = self.run_ledger_job(
                 job_name=f"conformance-{backend}", backend=backend
             )
@@ -922,6 +939,62 @@ class DistributedHarness:
             raise AssertionError(first.stderr.strip())
         completed = self._exec_sql(statement2, backend=backend)
         return completed.returncode != 0
+
+    def mint_identity(self, source, client):
+        completed = self._run(
+            [
+                "identity",
+                "mint",
+                "--source",
+                source,
+                "--client",
+                str(client),
+                "--json",
+            ]
+        )
+        if completed.returncode != EXIT_OK:
+            raise AssertionError(f"identity mint failed: {completed.stderr.strip()}")
+        return int(json.loads(completed.stdout)["client_id"])
+
+    def concurrent_identity(self, source, client, count=4):
+        env = self._env()
+        processes = [
+            subprocess.Popen(
+                [
+                    str(self.binary),
+                    "identity",
+                    "mint",
+                    "--source",
+                    source,
+                    "--client",
+                    str(client),
+                    "--json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            for _ in range(count)
+        ]
+        ids = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=60)
+            if process.returncode != EXIT_OK:
+                raise AssertionError(f"identity mint failed: {stderr.strip()}")
+            ids.append(int(json.loads(stdout)["client_id"]))
+        if len(set(ids)) != 1:
+            raise AssertionError(f"concurrent mint diverged: {ids}")
+        if (source, client) not in self.mappings:
+            self.set_mapping(source, client, ids[0])
+        return ids
+
+    def identity_row_count(self, source, client):
+        value = self.sql(
+            "SELECT COUNT(*) FROM clients "
+            f"WHERE source_id = '{source}' AND external_client = {int(client)}"
+        )
+        return int(value.strip().splitlines()[0])
 
     def allocate_concurrently(self, count):
         """Mint identities concurrently through the partitioner's identity command."""

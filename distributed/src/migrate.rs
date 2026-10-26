@@ -402,7 +402,7 @@ async fn provision_topics(
             MigrateError::Kafka(format!("create metadata client: {error}"))
         })?;
     for (name, _) in topics {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let ready = consumer
                 .fetch_metadata(Some(name), std::time::Duration::from_secs(2))

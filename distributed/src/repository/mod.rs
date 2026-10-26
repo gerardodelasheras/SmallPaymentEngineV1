@@ -261,6 +261,36 @@ pub struct JobProgress {
     pub processed: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobMetrics {
+    pub job_id: String,
+    pub state: JobState,
+    pub partitioner_complete: bool,
+    pub pending_events: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobStatus {
+    pub job_id: String,
+    pub state: JobState,
+    pub failure_reason: Option<String>,
+    pub progress: Vec<JobProgress>,
+    /// Every file is complete and every staged row has been emitted.
+    pub partitioner_complete: bool,
+}
+
+impl JobStatus {
+    /// The job has drained: the partitioner emitted every staged row and every
+    /// transaction partition processed all of its emitted events.
+    pub fn is_complete(&self) -> bool {
+        self.partitioner_complete
+            && self
+                .progress
+                .iter()
+                .all(|progress| progress.processed == progress.emitted)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     Running,
@@ -276,6 +306,18 @@ impl JobState {
             JobState::Completed => "completed",
             JobState::Failed => "failed",
             JobState::Rejected => "rejected",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, RepoError> {
+        match value {
+            "running" => Ok(JobState::Running),
+            "completed" => Ok(JobState::Completed),
+            "failed" => Ok(JobState::Failed),
+            "rejected" => Ok(JobState::Rejected),
+            other => Err(RepoError::InvalidState(format!(
+                "unknown job state '{other}'"
+            ))),
         }
     }
 }
@@ -294,6 +336,12 @@ pub enum RepoError {
     #[error("job progress is missing for job {job_id} partition {partition}")]
     MissingProgress { job_id: String, partition: i32 },
 
+    #[error("job {active} is already active")]
+    JobAlreadyActive { active: String },
+
+    #[error("job {0} not found")]
+    JobNotFound(String),
+
     #[error("transient database failure: {0}")]
     Transient(String),
 
@@ -303,7 +351,21 @@ pub enum RepoError {
 
 #[async_trait]
 pub trait LedgerRepository: Send + Sync {
+    /// Insert a job row without competing for the singleton job lock.
+    ///
+    /// Used for malformed submissions that are recorded and immediately failed.
     async fn create_job(&self, job_id: &str, manifest_hash: &str) -> Result<(), RepoError>;
+
+    /// Submit a job: insert it and acquire the singleton active-job lock.
+    ///
+    /// Returns `JobAlreadyActive` when another job is running; the rejected
+    /// submission leaves no job row behind.
+    async fn submit_job(&self, job_id: &str, manifest_hash: &str) -> Result<(), RepoError>;
+
+    async fn job_status(&self, job_id: &str) -> Result<JobStatus, RepoError>;
+
+    /// Snapshot of every job's drain state for the metrics surface.
+    async fn job_metrics(&self) -> Result<Vec<JobMetrics>, RepoError>;
 
     async fn finish_job(
         &self,
