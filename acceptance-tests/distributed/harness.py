@@ -115,6 +115,7 @@ class DistributedHarness:
         self.force_pending_file_ord = None
         self.crash_after_rows = None
         self.file_incomplete = False
+        self.worker_expect = 0
         self.file_complete = True
         self.emitted = 0
         self.export_path = self.workdir / "accounts.csv"
@@ -174,6 +175,24 @@ class DistributedHarness:
             f"WHERE job_id = '{job_id}' AND file_ord = {int(file_ord)}"
         )
         return row.strip() if row else None
+
+    def reset_ledger(self):
+        """Reset the database and recreate the topics for a clean scenario."""
+        completed = self._run(
+            [
+                "migrate",
+                "--backend",
+                self.backend,
+                "--fresh",
+                "--fresh-topics",
+                "--json",
+            ]
+        )
+        if completed.returncode != EXIT_OK:
+            raise AssertionError(
+                f"scenario reset failed: {completed.stderr.strip()}"
+            )
+        return completed
 
     def cleanup(self):
         shutil.rmtree(self.workdir, ignore_errors=True)
@@ -374,10 +393,6 @@ class DistributedHarness:
         self.job_seq += 1
         return job_id
 
-    @staticmethod
-    def staging_topic(job_name):
-        return f"staging-{job_name}"
-
     def _record(self, status, completed, stdout, stderr, job_id):
         self.last_stdout = "\n".join(stdout)
         self.last_stderr = "\n".join(stderr)
@@ -417,8 +432,6 @@ class DistributedHarness:
                 "migrate",
                 "--backend",
                 backend or self.backend,
-                "--staging-topic",
-                self.staging_topic(job_name),
                 "--json",
             ]
         elif stage == "ingest":
@@ -429,8 +442,6 @@ class DistributedHarness:
                 str(path),
                 "--job",
                 job_name,
-                "--staging-topic",
-                self.staging_topic(job_name),
                 "--json",
             ]
             if self.crash_after_rows is not None:
@@ -440,8 +451,6 @@ class DistributedHarness:
                 "partition",
                 "--job",
                 job_name,
-                "--staging-topic",
-                self.staging_topic(job_name),
                 "--drain",
                 "--expect",
                 str(self.staged),
@@ -452,7 +461,15 @@ class DistributedHarness:
             if self.stall_timeout is not None:
                 command += ["--stall-timeout", str(self.stall_timeout)]
         elif stage == "worker":
-            command = ["worker", "--drain", "--job", job_name]
+            command = [
+                "worker",
+                "--drain",
+                "--job",
+                job_name,
+                "--expect",
+                str(self.worker_expect),
+                "--json",
+            ]
         elif stage == "export":
             command = [
                 "export",
@@ -474,8 +491,11 @@ class DistributedHarness:
         else:
             raise ValueError(f"unknown stage {stage}")
 
+        if stage == "worker":
+            self.extra_env["RUST_LOG"] = "trace"
         completed = self._run(command, backend=backend)
         if stage == "worker":
+            self.extra_env.pop("RUST_LOG", None)
             self.worker_stderr = completed.stderr or ""
             self.worker_stdout = completed.stdout or ""
         if stage == "ingest" and completed.returncode == EXIT_OK:
@@ -498,6 +518,7 @@ class DistributedHarness:
             ]
             self.backpressure = bool(report.get("backpressure_applied"))
             self.stalled_watermarks = report.get("stalled_watermarks", [])
+            self.worker_expect = len(report.get("emitted", []))
         if stage == "migrate" and completed.returncode == EXIT_OK:
             self.seed_identities(backend=backend)
         status = self._classify(stage, completed)
@@ -874,9 +895,20 @@ class DistributedHarness:
 
     def redeliver(self):
         before = dict(self.accounts)
+        self.extra_env["RUST_LOG"] = "trace"
         completed = self._run(
-            ["worker", "--drain", "--job", self.job_id, "--redeliver"]
+            [
+                "worker",
+                "--drain",
+                "--job",
+                self.job_id,
+                "--expect",
+                str(self.worker_expect),
+                "--redeliver",
+                "--json",
+            ]
         )
+        self.extra_env.pop("RUST_LOG", None)
         self.worker_stderr = completed.stderr or ""
         if completed.returncode != EXIT_OK:
             raise AssertionError(
@@ -903,7 +935,7 @@ class DistributedHarness:
         lines = []
         for line in self.worker_stderr.splitlines():
             lowered = line.lower()
-            if "account locked" in lowered and ("warn" in lowered or "lock" in lowered):
+            if "warn" in lowered and "account locked" in lowered:
                 lines.append(line)
         return lines
 

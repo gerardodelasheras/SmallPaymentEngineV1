@@ -167,6 +167,16 @@ pub struct TransactionRow {
     pub state: EntryState,
 }
 
+impl TransactionRow {
+    pub fn state_str(&self) -> &'static str {
+        match self.state {
+            EntryState::Settled => "settled",
+            EntryState::Disputed => "disputed",
+            EntryState::ChargedBack => "charged_back",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobFileInput {
     pub source_id: String,

@@ -150,6 +150,11 @@ pub async fn run_fresh_with_topics(
     names: &TopicNames,
     partitions: TopicPartitions,
 ) -> Result<MigrateReport, MigrateError> {
+    match backend {
+        Backend::Postgres => reset_postgres(database_url).await?,
+        Backend::MariaDb => reset_mariadb(database_url).await?,
+    }
+
     let topics = [
         names.staging.as_str(),
         names.transactions.as_str(),

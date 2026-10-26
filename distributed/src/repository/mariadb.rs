@@ -10,7 +10,7 @@ use sqlx::Row;
 use tokio::sync::Mutex;
 use transaction_processor::{
     apply, Account, Amount, CanonicalClientId, EntryState, JournalEffect, JournalPolicy,
-    LedgerEntry, LedgerTransaction, ProcessingError, TransactionId,
+    LedgerEntry, LedgerTransaction, ProcessingError, TransactionId, TransactionType,
 };
 
 use super::{
@@ -571,12 +571,26 @@ impl MariaDbRepository {
                 amount: event.transaction.amount,
             };
 
-            match apply(
-                &mut account,
-                &ledger_transaction,
-                &journal,
-                JournalPolicy::RetainChargedBack,
-            ) {
+            // A monetary row that reuses an existing identifier is a duplicate
+            // even when the account is already locked. The shared core checks
+            // the lock first; the distributed terminal journal must classify
+            // reuse distinctly (charged-back IDs are never reusable).
+            let domain_result = if journal.entry.is_some()
+                && matches!(
+                    ledger_transaction.transaction_type,
+                    TransactionType::Deposit | TransactionType::Withdrawal
+                ) {
+                Err(ProcessingError::DuplicateTransaction(tx_id))
+            } else {
+                apply(
+                    &mut account,
+                    &ledger_transaction,
+                    &journal,
+                    JournalPolicy::RetainChargedBack,
+                )
+            };
+
+            match domain_result {
                 Ok(effect) => {
                     self.update_account(&mut db, client, &account).await?;
                     match effect {

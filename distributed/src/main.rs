@@ -17,13 +17,15 @@ use distributed::migrate::{
 };
 use distributed::partition::{
     EmittedEvent, PartitionError, PartitionRepository, Partitioner, StagingPosition,
-    StalledWatermark,
+    StalledWatermark, TransactionRecord,
 };
 use distributed::repository::mariadb::MariaDbRepository;
 use distributed::repository::postgres::PostgresRepository;
 use distributed::repository::{
-    JobFileInput, JobState, LedgerRepository, RepoError,
+    JobFileInput, JobState, LedgerEvent, LedgerRepository, RepoError,
 };
+use transaction_processor::{Amount, LedgerTransaction, ProcessingError};
+use tracing_subscriber::EnvFilter;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
 use rdkafka::{Message, Offset, TopicPartitionList};
@@ -37,6 +39,7 @@ Commands:
   ingest      Parse a manifest and stage rows
   partition   Map staged clients and emit ordered transactions
   worker      Consume transactions and apply the durable ledger
+  journal     Query the durable transaction journal
   export      Wait for a job and write its accounts CSV
   migrate     Apply database migrations and provision topics
 
@@ -60,6 +63,16 @@ ingest options:
   --staging-topic <name>         Default: staging
   --max-concurrent-files <n>     Default: 8
   --crash-after-rows <n>         Test hook: simulate a crash after n rows
+
+worker options:
+  --transactions-topic <name>    Default: transactions
+  --job <id>                     Filter for a finite drain run
+  --drain                        Assign partitions directly and exit
+  --expect <n>                   Rows expected for the job in a drain run
+  --redeliver                    Test hook: replay from the beginning
+
+journal options:
+  --tx <id>                      Transaction id to query
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +126,7 @@ struct PartitionReport {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    init_tracing();
     let args: Vec<String> = env::args().collect();
     let Some(command) = args.get(1) else {
         print!("{USAGE}");
@@ -145,8 +159,22 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        "worker" | "export" => {
-            eprintln!("distributed: '{command}' is not implemented yet");
+        "worker" => match run_worker(&args[2..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("distributed: worker failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        "journal" => match run_journal(&args[2..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("distributed: journal failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        "export" => {
+            eprintln!("distributed: 'export' is not implemented yet");
             ExitCode::from(1)
         }
         other => {
@@ -325,6 +353,14 @@ fn parse_partition_count(value: &str, option: &str) -> Result<i32, MigrateError>
         )));
     }
     Ok(count)
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 fn manifest_file_hash(path: &str) -> String {
@@ -922,6 +958,313 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
             report.stalled,
             report.emitted.len()
         );
+    }
+    Ok(())
+}
+
+async fn run_worker(args: &[String]) -> Result<(), CommandError> {
+    let mut backend = Backend::Postgres;
+    let mut database_url = env::var("DATABASE_URL").ok();
+    let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
+    let mut transactions_topic = "transactions".to_string();
+    let mut group = "distributed-worker".to_string();
+    let mut job_filter: Option<String> = None;
+    let mut expect: Option<u64> = None;
+    let mut drain = false;
+    let mut redeliver = false;
+    let mut json = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--backend" => {
+                let value = take_value(args, &mut index)?;
+                backend = parse_backend(&value)?;
+            }
+            "--database-url" => database_url = Some(take_value(args, &mut index)?),
+            "--kafka-bootstrap" => kafka_bootstrap = Some(take_value(args, &mut index)?),
+            "--transactions-topic" => {
+                transactions_topic = take_value(args, &mut index)?;
+            }
+            "--group" => group = take_value(args, &mut index)?,
+            "--job" => job_filter = Some(take_value(args, &mut index)?),
+            "--expect" => {
+                let value = take_value(args, &mut index)?;
+                expect = Some(value.parse::<u64>().map_err(|_| {
+                    CommandError::Config(
+                        "--expect must be a non-negative integer".to_string(),
+                    )
+                })?);
+            }
+            "--drain" => {
+                drain = true;
+                index += 1;
+            }
+            "--redeliver" => {
+                redeliver = true;
+                index += 1;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => {
+                return Err(CommandError::Config(format!(
+                    "unknown worker option '{other}'"
+                )));
+            }
+        }
+    }
+
+    let database_url = database_url.ok_or_else(|| {
+        CommandError::Config("DATABASE_URL or --database-url is required".to_string())
+    })?;
+    let kafka_bootstrap = kafka_bootstrap.ok_or_else(|| {
+        CommandError::Config("KAFKA_BOOTSTRAP or --kafka-bootstrap is required".to_string())
+    })?;
+
+    let repository = connect_ledger_repository(backend, &database_url).await?;
+    let consumer: StreamConsumer = rdkafka::config::ClientConfig::new()
+        .set("bootstrap.servers", &kafka_bootstrap)
+        .set("group.id", &group)
+        .set("client.id", "distributed-worker")
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .set("enable.partition.eof", "false")
+        .set("session.timeout.ms", "6000")
+        .set("socket.timeout.ms", "10000")
+        .set("fetch.wait.max.ms", "500")
+        .create()
+        .map_err(|error| {
+            CommandError::Config(format!("create Kafka consumer: {error}"))
+        })?;
+
+    if drain {
+        let metadata = consumer
+            .fetch_metadata(Some(&transactions_topic), Duration::from_secs(10))
+            .map_err(|error| {
+                CommandError::Config(format!(
+                    "fetch transactions metadata: {error}"
+                ))
+            })?;
+        let mut offsets = TopicPartitionList::new();
+        let mut any = false;
+        for topic in metadata.topics() {
+            if topic.name() != transactions_topic {
+                continue;
+            }
+            for partition in topic.partitions() {
+                offsets
+                    .add_partition_offset(
+                        &transactions_topic,
+                        partition.id(),
+                        Offset::Beginning,
+                    )
+                    .map_err(|error| {
+                        CommandError::Config(format!(
+                            "build worker assignment: {error}"
+                        ))
+                    })?;
+                any = true;
+            }
+        }
+        if !any {
+            return Err(CommandError::Config(format!(
+                "transactions topic '{transactions_topic}' has no partitions"
+            )));
+        }
+        consumer.assign(&offsets).map_err(|error| {
+            CommandError::Config(format!(
+                "assign transactions partitions: {error}"
+            ))
+        })?;
+    } else {
+        consumer
+            .subscribe(&[transactions_topic.as_str()])
+            .map_err(|error| {
+                CommandError::Config(format!(
+                    "subscribe to transactions topic: {error}"
+                ))
+            })?;
+    }
+
+    let expected = expect.unwrap_or(u64::MAX);
+    let mut records_seen = 0_u64;
+    let mut processed = 0_u64;
+    let mut last_message = Instant::now();
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if drain && records_seen >= expected {
+                    break;
+                }
+                if drain && last_message.elapsed() >= Duration::from_secs(15) {
+                    break;
+                }
+            }
+            message = consumer.recv() => {
+                match message {
+                    Ok(message) => {
+                        last_message = Instant::now();
+                        let payload = message.payload().unwrap_or_default();
+                        let record: TransactionRecord = serde_json::from_slice(payload)?;
+
+                        if let Some(job_id) = &job_filter {
+                            if &record.job_id != job_id {
+                                continue;
+                            }
+                        }
+
+                        records_seen += 1;
+                        let file_ord = i32::try_from(record.file_ord).map_err(|_| {
+                            CommandError::Config(
+                                "file ordinal exceeds i32".to_string(),
+                            )
+                        })?;
+                        let row_ord = i32::try_from(record.row_ord).map_err(|_| {
+                            CommandError::Config(
+                                "row ordinal exceeds i32".to_string(),
+                            )
+                        })?;
+                        let ledger_event = LedgerEvent {
+                            event_id: record.event_id.clone(),
+                            job_id: record.job_id.clone(),
+                            source_id: record.source_id.clone(),
+                            file_hash: record.file_hash.clone(),
+                            file_ord,
+                            row_ord,
+                            partition: message.partition(),
+                            transaction: LedgerTransaction {
+                                transaction_type: record.kind.into(),
+                                client: record.client_id,
+                                transaction_id: record.transaction_id,
+                                amount: record.amount_scaled.map(Amount::from_scaled),
+                            },
+                        };
+
+                        let outcome = repository.apply_event(&ledger_event).await?;
+                        if let Some(error) = &outcome.row_error {
+                            match error {
+                                ProcessingError::DisputeExceedsAvailable { .. } => {
+                                    tracing::warn!(
+                                        client = outcome.client_id,
+                                        transaction_id = record.transaction_id,
+                                        error = %error,
+                                        "client {} dispute exceeds available; account locked",
+                                        outcome.client_id
+                                    );
+                                }
+                                _ => {
+                                    tracing::trace!(
+                                        error = %error,
+                                        "skipped distributed transaction row"
+                                    );
+                                }
+                            }
+                        }
+
+                        if !drain {
+                            consumer
+                                .commit_message(&message, CommitMode::Sync)
+                                .map_err(|error| {
+                                    CommandError::Config(format!(
+                                        "commit worker offset: {error}"
+                                    ))
+                                })?;
+                        }
+                        processed += 1;
+
+                        if drain && records_seen >= expected {
+                            break;
+                        }
+                    }
+                    Err(KafkaError::PartitionEOF(_)) => {}
+                    Err(error) => {
+                        return Err(CommandError::Config(format!(
+                            "consume transactions topic: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    let report = serde_json::json!({
+        "job_id": job_filter,
+        "records_seen": records_seen,
+        "processed": processed,
+        "redeliver": redeliver,
+    });
+    if json {
+        println!("{report}");
+    } else {
+        println!(
+            "job={:?} records_seen={} processed={}",
+            report["job_id"], records_seen, processed
+        );
+    }
+    Ok(())
+}
+
+async fn run_journal(args: &[String]) -> Result<(), CommandError> {
+    let mut backend = Backend::Postgres;
+    let mut database_url = env::var("DATABASE_URL").ok();
+    let mut tx_id: Option<u32> = None;
+    let mut json = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--backend" => {
+                let value = take_value(args, &mut index)?;
+                backend = parse_backend(&value)?;
+            }
+            "--database-url" => database_url = Some(take_value(args, &mut index)?),
+            "--tx" => {
+                let value = take_value(args, &mut index)?;
+                tx_id = Some(value.parse::<u32>().map_err(|_| {
+                    CommandError::Config(
+                        "--tx must be a non-negative integer".to_string(),
+                    )
+                })?);
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => {
+                return Err(CommandError::Config(format!(
+                    "unknown journal option '{other}'"
+                )));
+            }
+        }
+    }
+
+    let database_url = database_url.ok_or_else(|| {
+        CommandError::Config("DATABASE_URL or --database-url is required".to_string())
+    })?;
+    let tx_id = tx_id.ok_or_else(|| {
+        CommandError::Config("--tx is required".to_string())
+    })?;
+    let repository = connect_ledger_repository(backend, &database_url).await?;
+    let report = match repository.transaction(tx_id).await? {
+        Some(row) => serde_json::json!({
+            "tx_id": row.tx_id,
+            "client_id": row.client_id,
+            "amount": row.amount.to_string(),
+            "state": row.state_str(),
+        }),
+        None => serde_json::json!({
+            "tx_id": tx_id,
+            "state": "unknown",
+        }),
+    };
+    if json {
+        println!("{report}");
+    } else {
+        println!("{report}");
     }
     Ok(())
 }

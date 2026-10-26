@@ -45,7 +45,7 @@
 
 ## 5. Distributed ledger worker
 
-- [ ] 5.1 Implement the worker consumer group and one DB transaction per event: ledger-event dedupe, job-event dedupe, account lock, shared-core application, journal update, progress, and job-client tracking; commit the offset only after the DB commit.
+- [x] 5.1 Implement the worker consumer group and one DB transaction per event: ledger-event dedupe, job-event dedupe, account lock, shared-core application, journal update, progress, and job-client tracking; commit the offset only after the DB commit.
 - [ ] 5.2 Implement the full terminal journal: chargeback updates `charged_back`, never deletes, rejects reuse, and rejects dispute/resolve against a charged-back row.
 - [ ] 5.3 Implement zeroed account initialization for the first parsed row before validation, including rejected rows, and include those clients in job reporting.
 - [ ] 5.4 Classify duplicate monetary IDs as `DuplicateTransaction` and foreign references as `NotOwner`; keep unknown/already-disputed references non-locking.

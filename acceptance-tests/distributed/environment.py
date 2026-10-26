@@ -28,6 +28,7 @@ def before_all(context):
 
 def before_scenario(context, scenario):
     context.harness.reset()
+    context.harness.reset_ledger()
 
 
 def after_all(context):

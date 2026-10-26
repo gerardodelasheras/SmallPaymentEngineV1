@@ -6,7 +6,8 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use distributed::migrate::{
-    run_fresh, run_with_topics, Backend, TopicNames, TopicPartitions,
+    run_fresh, run_fresh_with_topics, run_with_topics, Backend, MigrateReport, TopicNames,
+    TopicPartitions,
 };
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -227,6 +228,68 @@ async fn postgres_migrate_is_idempotent() {
     assert_eq!(kafka_partition_count(&names.staging), 1);
     assert_eq!(kafka_partition_count(&names.transactions), 2);
     assert_eq!(kafka_partition_count(&names.dlq), 1);
+}
+
+fn postgres_scalar(database: &str, sql: &str) -> String {
+    let output = run_client("psql", Some(database), sql);
+    assert!(
+        output.status.success(),
+        "postgres query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[tokio::test]
+async fn postgres_fresh_with_topics_resets_database_data() {
+    if !service_running("postgres") || !service_running("kafka") {
+        eprintln!("skipping PostgreSQL fresh-topics test: profiles are not running");
+        return;
+    }
+
+    reset_postgres();
+    let database_url = "postgres://ledger:ledger@localhost:5432/ledger_migrate_test";
+    let names = topic_names("pg-fresh-topics");
+
+    run_with_topics(
+        Backend::Postgres,
+        database_url,
+        KAFKA_BOOTSTRAP,
+        &names,
+        TopicPartitions::default(),
+    )
+    .await
+    .expect("initial migration");
+
+    let inserted = run_client(
+        "psql",
+        Some("ledger_migrate_test"),
+        "INSERT INTO jobs (job_id, manifest_hash, state) \
+         VALUES ('sentinel-job', repeat('0', 64), 'running');",
+    );
+    assert!(
+        inserted.status.success(),
+        "insert sentinel failed: {}",
+        String::from_utf8_lossy(&inserted.stderr)
+    );
+
+    let report: MigrateReport = run_fresh_with_topics(
+        Backend::Postgres,
+        database_url,
+        KAFKA_BOOTSTRAP,
+        &names,
+        TopicPartitions::default(),
+    )
+    .await
+    .expect("fresh migration with topics");
+
+    assert_eq!(report.migrations_applied, 1);
+    assert_eq!(
+        postgres_scalar("ledger_migrate_test", "SELECT COUNT(*) FROM jobs;"),
+        "0",
+        "run_fresh_with_topics must reset database rows"
+    );
+    assert_eq!(kafka_partition_count(&names.staging), 3);
 }
 
 #[tokio::test]
