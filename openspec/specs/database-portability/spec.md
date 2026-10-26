@@ -1,6 +1,10 @@
 # Database Portability Specification
 
-## ADDED Requirements
+## Purpose
+
+One repository contract and portable schema for PostgreSQL and MariaDB/Galera, with fixed-point money, bounded conflict retries, and one logical database.
+
+## Requirements
 
 ### Requirement: The ledger behavior is identical on PostgreSQL and MariaDB/Galera
 

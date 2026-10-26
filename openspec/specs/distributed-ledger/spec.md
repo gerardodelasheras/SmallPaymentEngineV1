@@ -1,6 +1,10 @@
 # Distributed Ledger Specification
 
-## ADDED Requirements
+## Purpose
+
+Durable, idempotent application of the shared ledger rules with one database transaction per event and a full terminal transaction journal.
+
+## Requirements
 
 ### Requirement: Each event is applied atomically before its offset is committed
 

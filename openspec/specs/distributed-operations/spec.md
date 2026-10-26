@@ -1,6 +1,10 @@
 # Distributed Operations Specification
 
-## ADDED Requirements
+## Purpose
+
+Operationally safe configuration, startup validation, retries, dead letters, health, and metrics for the distributed services.
+
+## Requirements
 
 ### Requirement: Configuration is validated at startup
 

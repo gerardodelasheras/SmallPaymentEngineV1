@@ -88,4 +88,5 @@
 - [x] 9.6 Run PostgreSQL and MariaDB contract tests; run Galera conflict tests where available.
 - [x] 9.7 Run `openspec validate kafka-distributed-ledger --type change --strict` (or the supported equivalent) and confirm the change is valid.
 - [x] 9.8 Review the effective spec and confirm the CLI specs and the six new capabilities compose without duplicate or missing scenarios.
-- [ ] 9.9 Confirm specs-zone and code-zone changes are committed separately with user approval; do not auto-commit or archive from a feature branch.
+- [x] 9.9 Confirm specs-zone and code-zone changes are committed separately with user approval; do not auto-commit or archive from a feature branch.
+  - Archived from `main` after implementation was merged. The sync/archive changes are committed separately from the code commits.

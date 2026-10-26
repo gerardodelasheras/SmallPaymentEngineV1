@@ -1,5 +1,9 @@
 # Client Identity Specification
 
+## Purpose
+
+Canonical, source-scoped BIGINT client identities that are minted once, reused across jobs, and keyed onto Kafka partitions.
+
 ## ADDED Requirements
 
 ### Requirement: Canonical client IDs are source-scoped and stable

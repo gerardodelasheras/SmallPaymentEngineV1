@@ -1,5 +1,9 @@
 # Job Reporting Specification
 
+## Purpose
+
+Serialized batch jobs that export a complete, job-scoped accounts CSV only after every partition and file watermark has drained.
+
 ## ADDED Requirements
 
 ### Requirement: Export waits for the job to drain

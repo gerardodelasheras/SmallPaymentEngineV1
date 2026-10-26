@@ -1,5 +1,9 @@
 # Stream Ingestion Specification
 
+## Purpose
+
+Manifest-driven, parallel ingestion that preserves per-client order across files and makes partial or repeated ingestion idempotent.
+
 ## ADDED Requirements
 
 ### Requirement: The manifest defines source, order, and integrity
