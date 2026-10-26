@@ -390,6 +390,37 @@ async fn postgres_repository_applies_events_atomically() {
         .expect("job clients")
         .contains(&client_two));
 
+    // A parsed row creates its account before validation, so a client whose
+    // only row is rejected still appears in the job report with zero balances.
+    let rejected_only = repository
+        .mint_or_get_client("alpha", 11)
+        .await
+        .expect("rejected-only client");
+    let outcome = repository
+        .apply_event(&event(
+            job,
+            rejected_only,
+            TransactionType::Withdrawal,
+            4,
+            Some("10.0"),
+            "event-rejected-only",
+            7,
+        ))
+        .await
+        .expect("rejected-only withdrawal");
+    assert!(matches!(
+        outcome.row_error,
+        Some(ProcessingError::InsufficientFunds)
+    ));
+    assert!(!outcome.locked);
+    let account = account_for(
+        &repository.accounts_for_job(job).await.expect("accounts"),
+        rejected_only,
+    );
+    assert_eq!(account.available, Amount::ZERO);
+    assert_eq!(account.held, Amount::ZERO);
+    assert!(!account.locked);
+
     repository
         .finish_job(job, JobState::Completed, None)
         .await
