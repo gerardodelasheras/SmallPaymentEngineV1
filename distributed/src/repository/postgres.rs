@@ -87,6 +87,86 @@ impl LedgerRepository for PostgresRepository {
         retry_transient(|| self.apply_event_once(event)).await
     }
 
+    async fn create_job_file(
+        &self,
+        job_id: &str,
+        source_id: &str,
+        file_ord: u32,
+        file_hash: &str,
+        location: &str,
+    ) -> Result<(), RepoError> {
+        let file_ord = i32::try_from(file_ord).map_err(|_| {
+            RepoError::InvalidState("file ordinal exceeds i32".to_string())
+        })?;
+        sqlx::query(
+            "INSERT INTO job_files \
+             (job_id, source_id, file_ord, file_hash, location, state) \
+             VALUES ($1, $2, $3, $4, $5, 'pending') \
+             ON CONFLICT (job_id, file_ord) DO NOTHING",
+        )
+        .bind(job_id)
+        .bind(source_id)
+        .bind(file_ord)
+        .bind(file_hash)
+        .bind(location)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_file_complete(
+        &self,
+        job_id: &str,
+        source_id: &str,
+        file_ord: u32,
+        row_count: u64,
+    ) -> Result<(), RepoError> {
+        let file_ord = i32::try_from(file_ord).map_err(|_| {
+            RepoError::InvalidState("file ordinal exceeds i32".to_string())
+        })?;
+        let row_count = i64::try_from(row_count).map_err(|_| {
+            RepoError::InvalidState("row count exceeds i64".to_string())
+        })?;
+        let updated = sqlx::query(
+            "UPDATE job_files SET state = 'complete', row_count = $4, \
+             completed_at = now() \
+             WHERE job_id = $1 AND source_id = $2 AND file_ord = $3",
+        )
+        .bind(job_id)
+        .bind(source_id)
+        .bind(file_ord)
+        .bind(row_count)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(RepoError::Inconsistent(format!(
+                "job file {job_id}/{source_id}/{file_ord} is not registered"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn job_file_complete(&self, job_id: &str, file_ord: u32) -> Result<bool, RepoError> {
+        let file_ord = i32::try_from(file_ord).map_err(|_| {
+            RepoError::InvalidState("file ordinal exceeds i32".to_string())
+        })?;
+        let row = sqlx::query(
+            "SELECT state FROM job_files WHERE job_id = $1 AND file_ord = $2",
+        )
+        .bind(job_id)
+        .bind(file_ord)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => {
+                let state: String = row.try_get("state")?;
+                Ok(state == "complete")
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn record_emitted(
         &self,
         job_id: &str,

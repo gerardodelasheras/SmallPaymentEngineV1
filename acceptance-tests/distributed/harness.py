@@ -237,15 +237,22 @@ class DistributedHarness:
 
     def manifest(self):
         if self.file_count is not None:
-            files = [
-                {
-                    "source_id": self.source,
-                    "ordinal": index + 1,
-                    "path": f"/tmp/distributed-file-{index}.csv",
-                    "sha256": "0" * 64,
-                }
-                for index in range(self.file_count)
-            ]
+            files = []
+            for index in range(self.file_count):
+                path = self.workdir / f"many-{index}.csv"
+                path.write_text(
+                    "type,client,tx,amount\n"
+                    f"deposit,1,{index + 1},1.0\n",
+                    encoding="utf-8",
+                )
+                files.append(
+                    {
+                        "source_id": self.source,
+                        "ordinal": index + 1,
+                        "path": str(path),
+                        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    }
+                )
         else:
             files = self.files
         return {"source_id": self.source, "files": files}
@@ -383,7 +390,14 @@ class DistributedHarness:
             command = ["migrate", "--backend", backend or self.backend, "--json"]
         elif stage == "ingest":
             path = manifest_path or self._manifest_path(job_name)
-            command = ["ingest", "--manifest", str(path), "--job", job_name]
+            command = [
+                "ingest",
+                "--manifest",
+                str(path),
+                "--job",
+                job_name,
+                "--json",
+            ]
         elif stage == "partition":
             command = ["partition", "--job", job_name]
         elif stage == "worker":
@@ -413,6 +427,11 @@ class DistributedHarness:
         if stage == "worker":
             self.worker_stderr = completed.stderr or ""
             self.worker_stdout = completed.stdout or ""
+        if stage == "ingest" and completed.returncode == EXIT_OK:
+            report = json.loads(completed.stdout)
+            self.staged = int(report.get("rows_staged", 0))
+            self.malformed_reported = int(report.get("rows_rejected", 0)) > 0
+            self.manifest_hash = report.get("manifest_hash")
         if stage == "migrate" and completed.returncode == EXIT_OK:
             self.seed_identities(backend=backend)
         status = self._classify(stage, completed)

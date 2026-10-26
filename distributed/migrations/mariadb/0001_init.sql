@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS job_files (
     file_hash VARCHAR(64) NOT NULL,
     location TEXT NOT NULL,
     state VARCHAR(16) NOT NULL,
-    row_count INT NOT NULL DEFAULT 0,
+    row_count BIGINT NOT NULL DEFAULT 0,
     completed_at DATETIME(6),
     PRIMARY KEY (job_id, file_ord),
     UNIQUE KEY job_files_source_ord_key (job_id, source_id, file_ord),

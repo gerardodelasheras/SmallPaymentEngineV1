@@ -233,6 +233,25 @@ pub trait LedgerRepository: Send + Sync {
 
     async fn apply_event(&self, event: &LedgerEvent) -> Result<ApplyOutcome, RepoError>;
 
+    async fn create_job_file(
+        &self,
+        job_id: &str,
+        source_id: &str,
+        file_ord: u32,
+        file_hash: &str,
+        location: &str,
+    ) -> Result<(), RepoError>;
+
+    async fn mark_file_complete(
+        &self,
+        job_id: &str,
+        source_id: &str,
+        file_ord: u32,
+        row_count: u64,
+    ) -> Result<(), RepoError>;
+
+    async fn job_file_complete(&self, job_id: &str, file_ord: u32) -> Result<bool, RepoError>;
+
     async fn record_emitted(
         &self,
         job_id: &str,

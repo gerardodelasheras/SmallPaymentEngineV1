@@ -1,13 +1,18 @@
 //! Entry points for the distributed ledger variant.
-//!
-//! The services are intentionally separate from the in-memory CLI crate. The
-//! `migrate` command is implemented; the service commands are implemented by
-//! later tasks in the change.
 
 use std::env;
+use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
+use distributed::ingest::{ingest, IngestConfig, IngestError};
+use distributed::kafka_staging::KafkaStagingSink;
+use distributed::manifest;
 use distributed::migrate::{run, run_fresh, Backend, MigrateError};
+use distributed::repository::mariadb::MariaDbRepository;
+use distributed::repository::postgres::PostgresRepository;
+use distributed::repository::{LedgerRepository, RepoError};
+use serde::Serialize;
 
 const USAGE: &str = "\
 Usage: distributed <command> [options]
@@ -19,13 +24,48 @@ Commands:
   export      Wait for a job and write its accounts CSV
   migrate     Apply database migrations and provision topics
 
-migrate options:
+Common options:
   --backend <postgres|mariadb>   Backend (default: postgres)
   --database-url <url>           Default: DATABASE_URL
   --kafka-bootstrap <url>        Default: KAFKA_BOOTSTRAP
-  --fresh                        Reset the schema first (test/teardown only)
   --json                         Print a JSON report
+
+migrate options:
+  --fresh                        Reset the schema first (test/teardown only)
+
+ingest options:
+  --manifest <path>              Manifest JSON (required)
+  --job <id>                     Job id (default: derived from manifest hash)
+  --staging-topic <name>         Default: staging
+  --max-concurrent-files <n>     Default: 8
 ";
+
+#[derive(Debug, thiserror::Error)]
+enum CommandError {
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error(transparent)]
+    Repo(#[from] RepoError),
+
+    #[error(transparent)]
+    Manifest(#[from] manifest::ManifestError),
+
+    #[error(transparent)]
+    Ingest(#[from] IngestError),
+
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Serialize)]
+struct IngestReport {
+    job_id: String,
+    manifest_hash: String,
+    files: u64,
+    rows_staged: u64,
+    rows_rejected: u64,
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -47,7 +87,14 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        "ingest" | "partition" | "worker" | "export" => {
+        "ingest" => match run_ingest(&args[2..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("distributed: ingest failed: {error}");
+                ExitCode::from(ingest_exit_code(&error))
+            }
+        },
+        "partition" | "worker" | "export" => {
             eprintln!("distributed: '{command}' is not implemented yet");
             ExitCode::from(1)
         }
@@ -56,6 +103,43 @@ async fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn manifest_exit_code(error: &manifest::ManifestError) -> u8 {
+    match error {
+        manifest::ManifestError::HashMismatch { .. } => 3,
+        manifest::ManifestError::DuplicateOrdinal { .. }
+        | manifest::ManifestError::MissingFile { .. }
+        | manifest::ManifestError::EmptyManifest
+        | manifest::ManifestError::EmptySource
+        | manifest::ManifestError::InvalidHash { .. }
+        | manifest::ManifestError::InvalidJson(_) => 2,
+        manifest::ManifestError::ManifestRead { .. }
+        | manifest::ManifestError::FileRead { .. } => 1,
+    }
+}
+
+fn ingest_exit_code(error: &CommandError) -> u8 {
+    match error {
+        CommandError::Manifest(error) => manifest_exit_code(error),
+        CommandError::Ingest(IngestError::Manifest(error)) => manifest_exit_code(error),
+        _ => 1,
+    }
+}
+
+fn take_value(args: &[String], index: &mut usize) -> Result<String, CommandError> {
+    let option = args[*index].clone();
+    let value = args.get(*index + 1).ok_or_else(|| {
+        CommandError::Config(format!("{option} requires a value"))
+    })?;
+    *index += 2;
+    Ok(value.clone())
+}
+
+fn parse_backend(value: &str) -> Result<Backend, CommandError> {
+    value
+        .parse::<Backend>()
+        .map_err(|error: MigrateError| CommandError::Config(error.to_string()))
 }
 
 async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
@@ -69,33 +153,22 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
     while index < args.len() {
         match args[index].as_str() {
             "--backend" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    MigrateError::Config("--backend requires a value".to_string())
-                })?;
-                backend = value.parse()?;
-                index += 2;
+                let value = take_value(args, &mut index)
+                    .map_err(|error| MigrateError::Config(error.to_string()))?;
+                backend = parse_backend(&value)
+                    .map_err(|error| MigrateError::Config(error.to_string()))?;
             }
             "--database-url" => {
                 database_url = Some(
-                    args.get(index + 1)
-                        .ok_or_else(|| {
-                            MigrateError::Config("--database-url requires a value".to_string())
-                        })?
-                        .clone(),
+                    take_value(args, &mut index)
+                        .map_err(|error| MigrateError::Config(error.to_string()))?,
                 );
-                index += 2;
             }
             "--kafka-bootstrap" => {
                 kafka_bootstrap = Some(
-                    args.get(index + 1)
-                        .ok_or_else(|| {
-                            MigrateError::Config(
-                                "--kafka-bootstrap requires a value".to_string(),
-                            )
-                        })?
-                        .clone(),
+                    take_value(args, &mut index)
+                        .map_err(|error| MigrateError::Config(error.to_string()))?,
                 );
-                index += 2;
             }
             "--json" => {
                 json = true;
@@ -114,14 +187,10 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
     }
 
     let database_url = database_url.ok_or_else(|| {
-        MigrateError::Config(
-            "DATABASE_URL or --database-url is required".to_string(),
-        )
+        MigrateError::Config("DATABASE_URL or --database-url is required".to_string())
     })?;
     let kafka_bootstrap = kafka_bootstrap.ok_or_else(|| {
-        MigrateError::Config(
-            "KAFKA_BOOTSTRAP or --kafka-bootstrap is required".to_string(),
-        )
+        MigrateError::Config("KAFKA_BOOTSTRAP or --kafka-bootstrap is required".to_string())
     })?;
 
     let report = if fresh {
@@ -138,6 +207,121 @@ async fn run_migrate(args: &[String]) -> Result<(), MigrateError> {
         println!(
             "backend={} migrations_applied={} topics_created={}",
             report.backend, report.migrations_applied, report.topics_created
+        );
+    }
+    Ok(())
+}
+
+async fn run_ingest(args: &[String]) -> Result<(), CommandError> {
+    let mut manifest_path: Option<String> = None;
+    let mut job_id: Option<String> = None;
+    let mut backend = Backend::Postgres;
+    let mut database_url = env::var("DATABASE_URL").ok();
+    let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
+    let mut staging_topic = "staging".to_string();
+    let mut max_concurrent_files = 8_usize;
+    let mut json = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--manifest" => manifest_path = Some(take_value(args, &mut index)?),
+            "--job" => job_id = Some(take_value(args, &mut index)?),
+            "--backend" => {
+                let value = take_value(args, &mut index)?;
+                backend = parse_backend(&value)?;
+            }
+            "--database-url" => database_url = Some(take_value(args, &mut index)?),
+            "--kafka-bootstrap" => kafka_bootstrap = Some(take_value(args, &mut index)?),
+            "--staging-topic" => staging_topic = take_value(args, &mut index)?,
+            "--max-concurrent-files" => {
+                let value = take_value(args, &mut index)?;
+                max_concurrent_files = value.parse::<usize>().map_err(|_| {
+                    CommandError::Config(
+                        "--max-concurrent-files must be a positive integer".to_string(),
+                    )
+                })?;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => {
+                return Err(CommandError::Config(format!(
+                    "unknown ingest option '{other}'"
+                )));
+            }
+        }
+    }
+
+    let manifest_path = manifest_path.ok_or_else(|| {
+        CommandError::Config("--manifest is required".to_string())
+    })?;
+    let database_url = database_url.ok_or_else(|| {
+        CommandError::Config("DATABASE_URL or --database-url is required".to_string())
+    })?;
+    let kafka_bootstrap = kafka_bootstrap.ok_or_else(|| {
+        CommandError::Config("KAFKA_BOOTSTRAP or --kafka-bootstrap is required".to_string())
+    })?;
+
+    let manifest = manifest::load(Path::new(&manifest_path))?;
+    let job_id = job_id.unwrap_or_else(|| {
+        format!("job-{}", &manifest.manifest_hash[..12])
+    });
+
+    let repository: Arc<dyn LedgerRepository> = match backend {
+        Backend::Postgres => Arc::new(PostgresRepository::connect(&database_url).await?),
+        Backend::MariaDb => Arc::new(MariaDbRepository::connect(&database_url).await?),
+    };
+
+    repository
+        .create_job(&job_id, &manifest.manifest_hash)
+        .await?;
+
+    for file in &manifest.files {
+        repository
+            .create_job_file(
+                &job_id,
+                &file.source_id,
+                file.ordinal,
+                &file.sha256,
+                &file.path.to_string_lossy(),
+            )
+            .await?;
+    }
+
+    let sink = Arc::new(
+        KafkaStagingSink::connect(&kafka_bootstrap, &staging_topic, Arc::clone(&repository))
+            .await?,
+    );
+    let summary = ingest(
+        &manifest,
+        &job_id,
+        sink,
+        IngestConfig {
+            max_concurrent_files,
+        },
+    )
+    .await?;
+
+    let report = IngestReport {
+        job_id,
+        manifest_hash: manifest.manifest_hash,
+        files: summary.files_processed,
+        rows_staged: summary.rows_staged,
+        rows_rejected: summary.rows_rejected,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!(
+            "job={} files={} rows_staged={} rows_rejected={} manifest_hash={}",
+            report.job_id,
+            report.files,
+            report.rows_staged,
+            report.rows_rejected,
+            report.manifest_hash
         );
     }
     Ok(())

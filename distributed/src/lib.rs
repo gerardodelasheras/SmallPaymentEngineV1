@@ -5,6 +5,9 @@
 //! delete-on-chargeback behaviour, so `JournalPolicy` is the only divergence
 //! between the two adapters.
 
+pub mod ingest;
+pub mod kafka_staging;
+pub mod manifest;
 pub mod migrate;
 pub mod repository;
 

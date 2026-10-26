@@ -275,7 +275,7 @@ def step_partitioner_emits_client(context, client):
 
 @both("the job is submitted")
 def step_job_submitted(context):
-    harness(context).run_job()
+    harness(context).run_job(stages=["migrate", "ingest"])
 
 
 @both("the job runs")
@@ -285,12 +285,12 @@ def step_job_runs(context):
 
 @both("ingestion runs in parallel")
 def step_ingestion_parallel(context):
-    harness(context).run_job()
+    harness(context).run_job(stages=["migrate", "ingest"])
 
 
 @both("ingestion runs")
 def step_ingestion_runs(context):
-    harness(context).run_job()
+    harness(context).run_job(stages=["migrate", "ingest"])
 
 
 @both("the partitioners run")

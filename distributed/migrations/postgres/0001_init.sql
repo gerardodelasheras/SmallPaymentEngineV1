@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS job_files (
     location TEXT NOT NULL,
     state VARCHAR(16) NOT NULL
         CHECK (state IN ('pending', 'staged', 'complete', 'failed')),
-    row_count INTEGER NOT NULL DEFAULT 0 CHECK (row_count >= 0),
+    row_count BIGINT NOT NULL DEFAULT 0 CHECK (row_count >= 0),
     completed_at TIMESTAMPTZ,
     PRIMARY KEY (job_id, file_ord),
     CONSTRAINT job_files_source_ord_key

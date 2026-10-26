@@ -35,9 +35,9 @@
 ## 4. Identity, manifest ingestion, and partitioner
 
 - [x] 4.1 Implement `mint_or_get` for `(source_id, external_client: u16)` and prove concurrent first sightings converge on one canonical ID.
-- [ ] 4.2 Define and validate the manifest model: source, unique ordinal, hash, location, duplicate/missing/hash-mismatch handling, and manifest hash identity.
-- [ ] 4.3 Implement bounded parallel ingestion using the shared CSV parser; stage the parsed transaction plus `(job_id, source_id, external_client, file_ord, row_ord, event_id)`; handle malformed rows without stopping the file.
-- [ ] 4.4 Produce staging records keyed by source-scoped external key with an idempotent producer; flush before marking a file complete.
+- [x] 4.2 Define and validate the manifest model: source, unique ordinal, hash, location, duplicate/missing/hash-mismatch handling, and manifest hash identity.
+- [x] 4.3 Implement bounded parallel ingestion using the shared CSV parser; stage the parsed transaction plus `(job_id, source_id, external_client, file_ord, row_ord, event_id)`; handle malformed rows without stopping the file.
+- [x] 4.4 Produce staging records keyed by source-scoped external key with an idempotent producer; flush before marking a file complete.
 - [ ] 4.5 Implement the partitioner: consume staging, map external keys to canonical IDs, own one client per staging partition, buffer until earlier files complete, emit in `(file_ord, row_ord)` order keyed by canonical ID, and update emitted progress.
 - [ ] 4.6 Bound partitioner buffers and apply Kafka backpressure; expose a stalled-watermark signal.
 - [ ] 4.7 Add restart/resume tests for partial files, re-ingestion idempotency, overlapping-file ordering, and manifest failure -> terminal job failure.
