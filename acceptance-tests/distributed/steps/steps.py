@@ -212,7 +212,17 @@ def step_file_17_first(context):
 
 @both("two partitioner instances and several clients")
 def step_two_partitioners(context):
-    harness(context).multi_partitioner = True
+    h = harness(context)
+    h.subject = 7
+    ordinal = 0
+    for client in (7, 8, 9, 10):
+        for row in (
+            f"deposit,{client},{client * 10},10.0",
+            f"withdrawal,{client},{client * 10 + 1},4.0",
+        ):
+            ordinal += 1
+            h.add_file(ordinal, rows=[row])
+    h.multi_partitioner = True
 
 
 @both("a client with more buffered rows than the configured limit")
@@ -324,7 +334,11 @@ def step_ingestion_runs(context):
 
 @both("the partitioners run")
 def step_partitioners_run(context):
-    harness(context).run_job()
+    h = harness(context)
+    if h.multi_partitioner:
+        h.run_two_partitioners()
+    else:
+        h.run_job()
 
 
 @both("more rows arrive")
@@ -421,15 +435,14 @@ def step_final_order(context):
 @both("every event for one client is emitted by exactly one owner")
 def step_single_owner(context):
     h = harness(context)
-    accepted(context)
-    assert h.owner_duplicates == 0
+    assert h.owner_duplicates == 0, h.partition_reports
 
 
 @both("no client's rows are interleaved or duplicated")
 def step_no_interleave(context):
     h = harness(context)
-    accepted(context)
-    assert h.owner_duplicates == 0
+    assert h.owner_duplicates == 0, h.partition_reports
+    assert h.interleaved_clients == [], (h.interleaved_clients, h.partition_reports)
 
 
 @both("ingestion pauses rather than growing the buffer without bound")

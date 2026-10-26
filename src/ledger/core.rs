@@ -410,6 +410,37 @@ mod tests {
     }
 
     #[test]
+    fn already_disputed_transaction_is_rejected_without_locking() {
+        let mut account = Account::default();
+        let mut journal = MemoryJournal::default();
+        apply_and_store(
+            &mut account,
+            &mut journal,
+            &transaction(TransactionType::Deposit, 1, 1, Some("10.0")),
+            JournalPolicy::RetainChargedBack,
+        )
+        .expect("deposit succeeds");
+        apply_and_store(
+            &mut account,
+            &mut journal,
+            &transaction(TransactionType::Dispute, 1, 1, None),
+            JournalPolicy::RetainChargedBack,
+        )
+        .expect("dispute succeeds");
+
+        let result = apply(
+            &mut account,
+            &transaction(TransactionType::Dispute, 1, 1, None),
+            &journal,
+            JournalPolicy::RetainChargedBack,
+        );
+
+        assert!(matches!(result, Err(ProcessingError::AlreadyDisputed(1))));
+        assert!(!account.locked);
+        assert_eq!(account.held, amount("10.0"));
+    }
+
+    #[test]
     fn resolve_returns_held_funds_and_marks_the_entry_settled() {
         let mut account = Account::default();
         let mut journal = MemoryJournal::default();
@@ -547,6 +578,32 @@ mod tests {
         );
 
         assert!(matches!(result, Err(ProcessingError::DuplicateTransaction(1))));
+    }
+
+    #[test]
+    fn charged_back_entry_rejects_dispute_and_resolve() {
+        let mut journal = MemoryJournal::default();
+        journal.entries.insert(
+            1,
+            LedgerEntry {
+                client: 1,
+                amount: amount("10.0"),
+                state: EntryState::ChargedBack,
+            },
+        );
+
+        for transaction_type in [TransactionType::Dispute, TransactionType::Resolve] {
+            let result = apply(
+                &mut Account::default(),
+                &transaction(transaction_type, 1, 1, None),
+                &journal,
+                JournalPolicy::RetainChargedBack,
+            );
+            assert!(
+                matches!(result, Err(ProcessingError::ChargedBack(1))),
+                "{transaction_type:?} must be rejected as charged back"
+            );
+        }
     }
 
     #[test]

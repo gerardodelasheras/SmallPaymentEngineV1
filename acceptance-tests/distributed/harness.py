@@ -116,6 +116,9 @@ class DistributedHarness:
         self.crash_after_rows = None
         self.file_incomplete = False
         self.worker_expect = 0
+        self.multi_partitioner = False
+        self.partition_reports = []
+        self.interleaved_clients = []
         self.file_complete = True
         self.emitted = 0
         self.export_path = self.workdir / "accounts.csv"
@@ -562,6 +565,89 @@ class DistributedHarness:
         if result.status == ACCEPTED:
             self.accounts = self.read_export_accounts()
         return result
+
+    def run_two_partitioners(self):
+        """Run two partitioner replicas in one consumer group.
+
+        Both subscribe before processing so Kafka splits the staging partitions
+        between them. Ownership is checked by the transactions partition each
+        canonical client lands on: a client must never span partitions.
+        """
+        self.ensure_ledger_file()
+        job_name = self._new_job_id()
+        self.job_id = job_name
+        self.run_stage("migrate", job_name=job_name)
+        self.run_stage("ingest", job_name=job_name)
+
+        group = f"distributed-acceptance-{job_name}"
+        command = [
+            str(self.binary),
+            "partition",
+            "--job",
+            job_name,
+            "--group",
+            group,
+            "--idle-exit",
+            "3",
+            "--startup-delay",
+            "10000",
+            "--json",
+        ]
+        processes = [
+            subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self._env(),
+            )
+            for _ in range(2)
+        ]
+
+        reports = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=120)
+            if process.returncode != EXIT_OK:
+                raise AssertionError(f"partitioner failed: {stderr.strip()}")
+            reports.append(json.loads(stdout))
+
+        self.partition_reports = reports
+        self.partition_report = reports
+        consumed = [
+            {int(partition) for partition in report.get("staging_partitions", [])}
+            for report in reports
+        ]
+        self.partition_ownership = consumed
+        for left in range(len(consumed)):
+            for right in range(left + 1, len(consumed)):
+                overlap = consumed[left] & consumed[right]
+                if overlap:
+                    raise AssertionError(
+                        f"two replicas consumed the same staging partitions: {overlap}"
+                    )
+        if not any(consumed):
+            raise AssertionError("no partitioner consumed a staging partition")
+        owners: dict[int, set[int]] = {}
+        rows: dict[int, list[tuple[int, int]]] = {}
+        for report in reports:
+            for entry in report.get("emitted", []):
+                client = int(entry["client_id"])
+                owners.setdefault(client, set()).add(int(entry["partition"]))
+                rows.setdefault(client, []).append(
+                    (int(entry["file_ord"]), int(entry["row_ord"]))
+                )
+        self.owner_duplicates = sum(
+            1 for partitions in owners.values() if len(partitions) > 1
+        )
+        self.interleaved_clients = sorted(
+            client for client, emitted in rows.items() if emitted != sorted(emitted)
+        )
+        self.order = [
+            (int(entry["file_ord"]), int(entry["row_ord"]))
+            for report in reports
+            for entry in report.get("emitted", [])
+        ]
+        return reports
 
     # --- export and account state -----------------------------------------
 

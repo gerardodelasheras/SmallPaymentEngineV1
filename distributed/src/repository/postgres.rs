@@ -86,7 +86,11 @@ impl LedgerRepository for PostgresRepository {
     }
 
     async fn apply_event(&self, event: &LedgerEvent) -> Result<ApplyOutcome, RepoError> {
-        retry_transient(|| self.apply_event_once(event)).await
+        retry_transient(|| async {
+            super::maybe_inject_fault()?;
+            self.apply_event_once(event).await
+        })
+        .await
     }
 
     async fn create_job_files(

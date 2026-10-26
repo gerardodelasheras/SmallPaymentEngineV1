@@ -40,6 +40,52 @@ impl IdBlock {
 
 const MAX_TRANSIENT_ATTEMPTS: u32 = 5;
 
+static TRANSIENT_RETRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Process-local count of transient retries performed by the repository.
+///
+/// Workers report the delta so operators can see contention (for example Galera
+/// certification failures) without scraping logs.
+pub fn transient_retry_count() -> u64 {
+    TRANSIENT_RETRIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static FAULT_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test hook for deterministic conflict coverage.
+///
+/// `DISTRIBUTED_FAULT=conflict:N` fails the first N event applications with a
+/// transient error; `conflict:always` fails every attempt. The fault is applied
+/// inside the retry loop, so the normal bounded-retry and DLQ paths are
+/// exercised exactly as in production.
+pub(crate) fn maybe_inject_fault() -> Result<(), RepoError> {
+    let Ok(spec) = std::env::var("DISTRIBUTED_FAULT") else {
+        return Ok(());
+    };
+    let (kind, budget) = match spec.split_once(':') {
+        Some((kind, budget)) => (kind, budget),
+        None => (spec.as_str(), "always"),
+    };
+    if kind != "conflict" {
+        return Ok(());
+    }
+
+    let attempt = FAULT_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let should_fail = match budget {
+        "always" => true,
+        count => attempt <= count.parse::<u64>().unwrap_or(0),
+    };
+    if should_fail {
+        Err(RepoError::Transient(
+            "injected certification conflict".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn is_transient(error: &sqlx::Error) -> bool {
     let Some(database) = error.as_database_error() else {
         return false;
@@ -73,6 +119,7 @@ where
         match operation().await {
             Ok(value) => return Ok(value),
             Err(error) if retryable(&error) && attempt < MAX_TRANSIENT_ATTEMPTS => {
+                TRANSIENT_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let base = 5_u64 * 2_u64.pow(attempt - 1);
                 let jitter = u64::from(attempt) * 3 % 7;
                 tokio::time::sleep(std::time::Duration::from_millis(base + jitter)).await;
@@ -349,5 +396,26 @@ mod tests {
             })
         ));
         assert_eq!(attempts.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn transient_retries_are_counted_for_metrics() {
+        let before = transient_retry_count();
+        let attempts = AtomicU32::new(0);
+
+        let value = retry_transient(|| async {
+            let current = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if current < 3 {
+                Err(RepoError::Transient("conflict".to_string()))
+            } else {
+                Ok(current)
+            }
+        })
+        .await
+        .expect("retry succeeds");
+
+        assert_eq!(value, 3);
+        // The counter is process-global, so other tests may add to it too.
+        assert!(transient_retry_count() >= before + 2);
     }
 }

@@ -46,13 +46,13 @@
 ## 5. Distributed ledger worker
 
 - [x] 5.1 Implement the worker consumer group and one DB transaction per event: ledger-event dedupe, job-event dedupe, account lock, shared-core application, journal update, progress, and job-client tracking; commit the offset only after the DB commit.
-- [ ] 5.2 Implement the full terminal journal: chargeback updates `charged_back`, never deletes, rejects reuse, and rejects dispute/resolve against a charged-back row.
-- [ ] 5.3 Implement zeroed account initialization for the first parsed row before validation, including rejected rows, and include those clients in job reporting.
-- [ ] 5.4 Classify duplicate monetary IDs as `DuplicateTransaction` and foreign references as `NotOwner`; keep unknown/already-disputed references non-locking.
-- [ ] 5.5 Emit exactly one warn-level warning per over-available lock, naming the canonical client ID; keep later locked rows warning-free.
-- [ ] 5.6 Add worker health/readiness and metrics for records processed, retries, DLQ sends, and locked accounts.
-- [ ] 5.7 Add rebalancing, redelivery, crash-between-DB-and-offset, and duplicate-event tests; prove no double-apply.
-- [ ] 5.8 Add DLQ handling for exhausted retries with job/file/row/error metadata; a poison event fails the job and writes no partial export.
+- [x] 5.2 Implement the full terminal journal: chargeback updates `charged_back`, never deletes, rejects reuse, and rejects dispute/resolve against a charged-back row.
+- [x] 5.3 Implement zeroed account initialization for the first parsed row before validation, including rejected rows, and include those clients in job reporting.
+- [x] 5.4 Classify duplicate monetary IDs as `DuplicateTransaction` and foreign references as `NotOwner`; keep unknown/already-disputed references non-locking.
+- [x] 5.5 Emit exactly one warn-level warning per over-available lock, naming the canonical client ID; keep later locked rows warning-free.
+- [x] 5.6 Add worker health/readiness and metrics for records processed, retries, DLQ sends, and locked accounts.
+- [x] 5.7 Add rebalancing, redelivery, crash-between-DB-and-offset, and duplicate-event tests; prove no double-apply.
+- [x] 5.8 Add DLQ handling for exhausted retries with job/file/row/error metadata; a poison event fails the job and writes no partial export.
 
 ## 6. Job submission, completion, and export
 

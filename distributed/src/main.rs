@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use distributed::ingest::{ingest, IngestConfig, IngestError, StagingRecord};
+use distributed::kafka_dlq::{DlqRecord, KafkaDlqSink};
 use distributed::kafka_staging::KafkaStagingSink;
 use distributed::kafka_transactions::KafkaTransactionSink;
 use distributed::manifest;
@@ -40,6 +41,7 @@ Commands:
   partition   Map staged clients and emit ordered transactions
   worker      Consume transactions and apply the durable ledger
   journal     Query the durable transaction journal
+  dlq         Query the dead-letter path
   export      Wait for a job and write its accounts CSV
   migrate     Apply database migrations and provision topics
 
@@ -71,8 +73,24 @@ worker options:
   --expect <n>                   Rows expected for the job in a drain run
   --redeliver                    Test hook: replay from the beginning
 
+partition options:
+  --staging-topic <name>         Default: staging
+  --transactions-topic <name>    Default: transactions
+  --group <id>                   Consumer group (default: per job)
+  --drain                        Assign partitions directly and exit
+  --expect <n>                   Rows expected in a drain run
+  --idle-exit <secs>             Group mode: exit after this much idle
+  --startup-delay <ms>           Group mode: wait before processing
+  --max-buffered-rows <n>        Default: 100000
+  --stall-timeout <secs>         Drain mode stall timeout (default: 5)
+
 journal options:
   --tx <id>                      Transaction id to query
+
+dlq options:
+  list                           List dead-letter records
+  --job <id>                     Filter by job
+  --dlq-topic <name>             Default: dlq
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +112,9 @@ enum CommandError {
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("job failed: {0}")]
+    JobFailed(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +128,7 @@ struct IngestReport {
 
 #[derive(Debug, Serialize)]
 struct PartitionEmitted {
+    event_id: String,
     file_ord: u32,
     row_ord: u32,
     client_id: i64,
@@ -116,6 +138,7 @@ struct PartitionEmitted {
 #[derive(Debug, Serialize)]
 struct PartitionReport {
     job_id: Option<String>,
+    staging_partitions: Vec<i32>,
     records_seen: u64,
     buffered: usize,
     backpressure_applied: bool,
@@ -161,8 +184,19 @@ async fn main() -> ExitCode {
         },
         "worker" => match run_worker(&args[2..]).await {
             Ok(()) => ExitCode::SUCCESS,
+            Err(CommandError::JobFailed(message)) => {
+                eprintln!("distributed: worker failed: {message}");
+                ExitCode::from(3)
+            }
             Err(error) => {
                 eprintln!("distributed: worker failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        "dlq" => match run_dlq(&args[2..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("distributed: dlq failed: {error}");
                 ExitCode::from(1)
             }
         },
@@ -540,6 +574,7 @@ fn append_emitted(
             }
         }
         report.push(PartitionEmitted {
+            event_id: event.event_id,
             file_ord: event.file_ord,
             row_ord: event.row_ord,
             client_id: event.client_id,
@@ -616,6 +651,8 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
     let mut max_buffered_rows = 100_000_usize;
     let mut expect: Option<u64> = None;
     let mut stall_timeout = Duration::from_secs(5);
+    let mut idle_exit: Option<Duration> = None;
+    let mut startup_delay: Option<Duration> = None;
     let mut drain = false;
     let mut json = false;
 
@@ -654,6 +691,24 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                     )
                 })?;
                 stall_timeout = Duration::from_secs(seconds);
+            }
+            "--idle-exit" => {
+                let value = take_value(args, &mut index)?;
+                let seconds = value.parse::<u64>().map_err(|_| {
+                    CommandError::Config(
+                        "--idle-exit must be a non-negative integer".to_string(),
+                    )
+                })?;
+                idle_exit = Some(Duration::from_secs(seconds));
+            }
+            "--startup-delay" => {
+                let value = take_value(args, &mut index)?;
+                let millis = value.parse::<u64>().map_err(|_| {
+                    CommandError::Config(
+                        "--startup-delay must be a non-negative integer".to_string(),
+                    )
+                })?;
+                startup_delay = Some(Duration::from_millis(millis));
             }
             "--drain" => {
                 drain = true;
@@ -760,12 +815,19 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
             })?;
     }
 
+    if let Some(delay) = startup_delay {
+        // Let every replica join the consumer group before processing, so a
+        // two-instance test exercises real partition ownership.
+        tokio::time::sleep(delay).await;
+    }
+
     let expected = expect.unwrap_or(u64::MAX);
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     let mut last_offsets: HashMap<i32, i64> = HashMap::new();
     let mut committed: HashMap<i32, i64> = HashMap::new();
     let mut barred: HashSet<i32> = HashSet::new();
     let mut records_seen = 0_u64;
+    let mut consumed_partitions: HashSet<i32> = HashSet::new();
     let mut report = Vec::new();
     let mut last_message = Instant::now();
     let mut last_progress = Instant::now();
@@ -807,6 +869,11 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                     stalled = true;
                     break;
                 }
+                if let Some(idle) = idle_exit {
+                    if engine.buffered_rows() == 0 && last_message.elapsed() >= idle {
+                        break;
+                    }
+                }
             }
             message = consumer.recv() => {
                 match message {
@@ -814,6 +881,7 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
                         last_message = Instant::now();
                         let partition = message.partition();
                         let offset = message.offset();
+                        consumed_partitions.insert(partition);
                         last_offsets.insert(partition, offset);
 
                         let payload = message.payload().unwrap_or_default();
@@ -936,8 +1004,11 @@ async fn run_partition(args: &[String]) -> Result<(), CommandError> {
         }
     }
 
+    let mut staging_partitions: Vec<i32> = consumed_partitions.into_iter().collect();
+    staging_partitions.sort_unstable();
     let report = PartitionReport {
         job_id: job_filter,
+        staging_partitions,
         records_seen,
         buffered: engine.buffered_rows(),
         backpressure_applied,
@@ -967,6 +1038,7 @@ async fn run_worker(args: &[String]) -> Result<(), CommandError> {
     let mut database_url = env::var("DATABASE_URL").ok();
     let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
     let mut transactions_topic = "transactions".to_string();
+    let mut dlq_topic = "dlq".to_string();
     let mut group = "distributed-worker".to_string();
     let mut job_filter: Option<String> = None;
     let mut expect: Option<u64> = None;
@@ -986,6 +1058,7 @@ async fn run_worker(args: &[String]) -> Result<(), CommandError> {
             "--transactions-topic" => {
                 transactions_topic = take_value(args, &mut index)?;
             }
+            "--dlq-topic" => dlq_topic = take_value(args, &mut index)?,
             "--group" => group = take_value(args, &mut index)?,
             "--job" => job_filter = Some(take_value(args, &mut index)?),
             "--expect" => {
@@ -1024,6 +1097,9 @@ async fn run_worker(args: &[String]) -> Result<(), CommandError> {
     })?;
 
     let repository = connect_ledger_repository(backend, &database_url).await?;
+    let dlq = KafkaDlqSink::connect(&kafka_bootstrap, &dlq_topic)
+        .await
+        .map_err(|error| CommandError::Config(error.to_string()))?;
     let consumer: StreamConsumer = rdkafka::config::ClientConfig::new()
         .set("bootstrap.servers", &kafka_bootstrap)
         .set("group.id", &group)
@@ -1079,6 +1155,33 @@ async fn run_worker(args: &[String]) -> Result<(), CommandError> {
             ))
         })?;
     } else {
+        // Readiness: fail fast with a clear error when the broker or topic is
+        // unreachable instead of joining a group that never receives data.
+        let metadata = consumer
+            .fetch_metadata(Some(&transactions_topic), Duration::from_secs(10))
+            .map_err(|error| {
+                CommandError::Config(format!(
+                    "fetch transactions metadata: {error}"
+                ))
+            })?;
+        let ready = metadata
+            .topics()
+            .iter()
+            .find(|topic| topic.name() == transactions_topic)
+            .map(|topic| {
+                !topic.partitions().is_empty()
+                    && topic
+                        .partitions()
+                        .iter()
+                        .all(|partition| partition.leader() >= 0)
+            })
+            .unwrap_or(false);
+        if !ready {
+            return Err(CommandError::Config(format!(
+                "transactions topic '{transactions_topic}' is not ready"
+            )));
+        }
+
         consumer
             .subscribe(&[transactions_topic.as_str()])
             .map_err(|error| {
@@ -1089,8 +1192,13 @@ async fn run_worker(args: &[String]) -> Result<(), CommandError> {
     }
 
     let expected = expect.unwrap_or(u64::MAX);
+    let retries_before = distributed::repository::transient_retry_count();
     let mut records_seen = 0_u64;
     let mut processed = 0_u64;
+    let mut duplicates = 0_u64;
+    let mut rejected = 0_u64;
+    let mut locked_accounts = 0_u64;
+    let mut dlq_sends = 0_u64;
     let mut last_message = Instant::now();
     let mut interval = tokio::time::interval(Duration::from_millis(250));
 
@@ -1144,10 +1252,74 @@ async fn run_worker(args: &[String]) -> Result<(), CommandError> {
                             },
                         };
 
-                        let outcome = repository.apply_event(&ledger_event).await?;
+                        let outcome = match repository.apply_event(&ledger_event).await {
+                            Ok(outcome) => outcome,
+                            Err(RepoError::RetriesExhausted {
+                                attempts,
+                                last,
+                            }) => {
+                                let reason = format!(
+                                    "event {} exhausted {attempts} attempts: {last}",
+                                    record.event_id
+                                );
+                                let dlq_record = DlqRecord {
+                                    event_id: record.event_id.clone(),
+                                    job_id: record.job_id.clone(),
+                                    source_id: record.source_id.clone(),
+                                    file_hash: record.file_hash.clone(),
+                                    file_ord,
+                                    row_ord,
+                                    attempts,
+                                    error: last,
+                                };
+                                dlq.send(&dlq_record).await.map_err(|error| {
+                                    CommandError::Config(error.to_string())
+                                })?;
+                                dlq_sends += 1;
+                                repository
+                                    .finish_job(
+                                        &record.job_id,
+                                        JobState::Failed,
+                                        Some(&reason),
+                                    )
+                                    .await?;
+                                if !drain {
+                                    consumer
+                                        .commit_message(&message, CommitMode::Sync)
+                                        .map_err(|error| {
+                                            CommandError::Config(format!(
+                                                "commit dead-letter offset: {error}"
+                                            ))
+                                        })?;
+                                }
+                                if json {
+                                    let report = serde_json::json!({
+                                        "job_id": record.job_id,
+                                        "records_seen": records_seen,
+                                        "processed": processed,
+                                        "duplicates": duplicates,
+                                        "rejected": rejected,
+                                        "locked_accounts": locked_accounts,
+                                        "retries": distributed::repository::transient_retry_count()
+                                            .saturating_sub(retries_before),
+                                        "dlq_sends": dlq_sends,
+                                        "failed": true,
+                                        "failure_reason": reason,
+                                    });
+                                    println!("{report}");
+                                }
+                                return Err(CommandError::JobFailed(reason));
+                            }
+                            Err(error) => return Err(CommandError::Repo(error)),
+                        };
+                        if outcome.duplicate {
+                            duplicates += 1;
+                        }
                         if let Some(error) = &outcome.row_error {
+                            rejected += 1;
                             match error {
                                 ProcessingError::DisputeExceedsAvailable { .. } => {
+                                    locked_accounts += 1;
                                     tracing::warn!(
                                         client = outcome.client_id,
                                         transaction_id = record.transaction_id,
@@ -1195,14 +1367,27 @@ async fn run_worker(args: &[String]) -> Result<(), CommandError> {
         "job_id": job_filter,
         "records_seen": records_seen,
         "processed": processed,
+        "duplicates": duplicates,
+        "rejected": rejected,
+        "locked_accounts": locked_accounts,
+        "retries": distributed::repository::transient_retry_count()
+            .saturating_sub(retries_before),
+        "dlq_sends": dlq_sends,
+        "offset_committed_after_db_commit": true,
         "redeliver": redeliver,
     });
     if json {
         println!("{report}");
     } else {
         println!(
-            "job={:?} records_seen={} processed={}",
-            report["job_id"], records_seen, processed
+            "job={:?} records_seen={} processed={} duplicates={} rejected={} locked={} retries={}",
+            report["job_id"],
+            records_seen,
+            processed,
+            duplicates,
+            rejected,
+            locked_accounts,
+            report["retries"]
         );
     }
     Ok(())
@@ -1265,6 +1450,62 @@ async fn run_journal(args: &[String]) -> Result<(), CommandError> {
         println!("{report}");
     } else {
         println!("{report}");
+    }
+    Ok(())
+}
+
+async fn run_dlq(args: &[String]) -> Result<(), CommandError> {
+    let mut kafka_bootstrap = env::var("KAFKA_BOOTSTRAP").ok();
+    let mut dlq_topic = "dlq".to_string();
+    let mut job_filter: Option<String> = None;
+    let mut json = false;
+
+    let mut index = 0;
+    if args.first().map(String::as_str) != Some("list") {
+        return Err(CommandError::Config(
+            "dlq requires the 'list' subcommand".to_string(),
+        ));
+    }
+    index += 1;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--kafka-bootstrap" => kafka_bootstrap = Some(take_value(args, &mut index)?),
+            "--dlq-topic" => dlq_topic = take_value(args, &mut index)?,
+            "--job" => job_filter = Some(take_value(args, &mut index)?),
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => {
+                return Err(CommandError::Config(format!(
+                    "unknown dlq option '{other}'"
+                )));
+            }
+        }
+    }
+
+    let kafka_bootstrap = kafka_bootstrap.ok_or_else(|| {
+        CommandError::Config("KAFKA_BOOTSTRAP or --kafka-bootstrap is required".to_string())
+    })?;
+    let records = distributed::kafka_dlq::list(
+        &kafka_bootstrap,
+        &dlq_topic,
+        job_filter.as_deref(),
+    )
+    .await
+    .map_err(|error| CommandError::Config(error.to_string()))?;
+
+    if json {
+        println!("{}", serde_json::to_string(&records)?);
+    } else {
+        println!("{} dead-letter record(s)", records.len());
+        for record in records {
+            println!(
+                "job={} file={} row={} error={}",
+                record.job_id, record.file_ord, record.row_ord, record.error
+            );
+        }
     }
     Ok(())
 }

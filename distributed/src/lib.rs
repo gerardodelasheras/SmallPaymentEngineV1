@@ -6,6 +6,7 @@
 //! between the two adapters.
 
 pub mod ingest;
+pub mod kafka_dlq;
 pub mod kafka_staging;
 pub mod kafka_transactions;
 pub mod manifest;
